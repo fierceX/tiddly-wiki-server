@@ -51,6 +51,47 @@ struct AppConfig {
     filesdir: PathBuf,
 }
 
+// 定义一个结构体来持有预处理好的 HTML 模板部件
+#[derive(Clone)]
+struct WikiTemplate {
+    // 包含直到 core tiddlers 结束的所有内容（不含最后一个 ']'）
+    // 例如: <html>...<script...>[{"title": "$:/core"...}
+    prefix: String, 
+    // 包含最后一个 ']' 及其之后的所有内容
+    // 例如: ]</script></body></html>
+    suffix: String,
+}
+impl WikiTemplate {
+    fn new(html_content: &str) -> Self {
+        let store_marker = r#"<script class="tiddlywiki-tiddler-store" type="application/json">"#;
+        
+        // 1. 定位 script 标签开始
+        let start_tag_idx = html_content
+            .find(store_marker)
+            .expect("Invalid empty.html: missing store script tag");
+        
+        // 2. 定位 script 标签结束 (从开始标签后面找)
+        let end_tag_idx = html_content[start_tag_idx..]
+            .find("</script>")
+            .map(|i| start_tag_idx + i)
+            .expect("Invalid empty.html: missing closing script tag");
+
+        // 3. 定位 JSON 数组的最后一个 ']'
+        // 我们在 </script> 之前倒着找最近的一个 ']'
+        let split_idx = html_content[..end_tag_idx]
+            .rfind(']')
+            .expect("Invalid empty.html: store content is not a valid JSON array");
+
+        // split_idx 指向 ']' 的位置
+        // prefix = 0 .. split_idx (不包含 ']')
+        // suffix = split_idx .. end (包含 ']')
+        Self {
+            prefix: html_content[..split_idx].to_string(),
+            suffix: html_content[split_idx..].to_string(),
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     // TODO: Instrument handlers & DB code.
@@ -59,6 +100,10 @@ async fn main() {
     let config = AppConfig::parse();
 
     let datastore = initialize_datastore(&config).expect("Error initializing datastore");
+    
+    let empty_html_str = include_str!("../empty.html"); 
+    let template = Arc::new(WikiTemplate::new(empty_html_str));
+
     let addr = SocketAddr::from((config.bind, config.port));
     // This services handles the [Get File](https://tiddlywiki.com/#WebServer%20API%3A%20Get%20File)
     // API endpoint.
@@ -76,7 +121,8 @@ async fn main() {
         .route("/bags/default/tiddlers/:title", delete(delete_tiddler))
         .route("/bags/efault/tiddlers/:title", delete(delete_tiddler))
         .route_service("/files/", files_service)
-        .layer(Extension(datastore));
+        .layer(Extension(datastore))
+        .layer(Extension(template));
 
     println!("listening on {}", addr);
 
@@ -102,30 +148,46 @@ fn initialize_datastore(config: &AppConfig) -> AppResult<DataStore> {
 ///
 /// Serves the [Get TiddWiki](https://tiddlywiki.com/#WebServer%20API%3A%20Get%20Wiki)
 /// API endpoint.
-async fn render_wiki(Extension(ds): Extension<DataStore>) -> AppResult<axum::response::Response> {
+async fn render_wiki(Extension(ds): Extension<DataStore>,Extension(template): Extension<Arc<WikiTemplate>>,) -> AppResult<axum::response::Response> {
     use axum::response::Response;
 
     let mut ds_lock = ds.lock().await;
     let datastore = &mut *ds_lock;
 
-    const TW_SEGMENT_1: &[u8] = include_bytes!("./tw_segment_1");
-    const TW_SEGMENT_2: &[u8] = include_bytes!("./tw_segment_2");
-
     let tiddlers: Vec<Tiddler> = datastore.all()?;
-    let json_tiddlers = serde_json::to_string(&tiddlers)
-        .map_err(|e| AppError::Serialization(format!("error serializing tiddlers: {}", e)))?;
 
-    let content_length = TW_SEGMENT_1.len() + TW_SEGMENT_2.len() + json_tiddlers.len();
+    let db_json_values: Vec<serde_json::Value> = tiddlers
+        .iter()
+        .map(|t| t.as_value()) 
+        .collect();
 
-    let mut buffer: Vec<u8> = Vec::with_capacity(content_length);
-    buffer.extend(TW_SEGMENT_1);
-    buffer.extend(json_tiddlers.as_bytes());
-    buffer.extend(TW_SEGMENT_2);
+    let db_json_str = serde_json::to_string(&db_json_values)
+        .map_err(|e| AppError::Serialization(format!("error serializing db: {}", e)))?;
+
+    
+    // 关键步骤：处理 JSON 字符串
+    // 1. 去掉首尾的 '[' 和 ']'，因为我们要把它塞进现有的数组里
+    let inner_json = &db_json_str[1..db_json_str.len() - 1];
+
+    // 2. 防止 HTML 注入攻击/破坏 (非常重要)
+    // 如果 tiddler 内容里包含 "</script>"，浏览器会提前关闭标签。
+    // 我们必须转义它。serde_json 默认不转义 '/'。
+    // 替换 </script> 为 <\/script> 或者 \u003c/script>
+    let safe_json = inner_json.replace("</script>", "<\\/script>");
+
+    // 3. 拼接
+    // 结构: prefix( ...[core_last ) + "," + db_items + suffix( ]... )
+    // 注意中间加个逗号
+    let mut buffer = Vec::with_capacity(template.prefix.len() + safe_json.len() + template.suffix.len() + 1);
+    buffer.extend(template.prefix.as_bytes());
+    buffer.push(b','); // 添加连接 core 和 db 的逗号
+    buffer.extend(safe_json.as_bytes());
+    buffer.extend(template.suffix.as_bytes());
+
 
     Response::builder()
         .status(StatusCode::OK)
         .header("Content-Type", "text/html")
-        .header("Content-Length", content_length)
         .body(axum::body::Body::from(buffer))
         .map_err(|e| AppError::Response(format!("error building wiki: {}", e)))
 }
@@ -305,12 +367,52 @@ pub(crate) struct Tiddler {
 
 impl Tiddler {
     pub(crate) fn as_value(&self) -> Value {
-        let mut meta = self.meta.clone();
-        meta["title"] = Value::String(self.title.clone());
 
-        // NOTE(nknight): TiddlyWiki expects revisions to be strings instead of
-        // numbers.
-        meta["revision"] = Value::String(self.revision.to_string());
+        let mut meta = self.meta.clone();
+        if let Value::Object(ref mut map) = meta {
+            // 1. 展平 fields
+            if let Some(Value::Object(fields)) = map.remove("fields") {
+                for (k, v) in fields {
+                    map.entry(k).or_insert(v);
+                }
+            }
+
+        if let Some(tags_val) = map.get("tags") {
+                match tags_val {
+                    // 如果它是 Array，我们需要把它变成 "tag1 [[tag 2]]" 这种格式
+                    Value::Array(arr) => {
+                        let tag_str = arr.iter()
+                            .filter_map(|v| v.as_str())
+                            .map(|s| {
+                                // 如果标签含有空格，需要用双中括号包起来
+                                if s.contains(' ') {
+                                    format!("[[{}]]", s)
+                                } else {
+                                    s.to_string()
+                                }
+                            })
+                            .collect::<Vec<String>>()
+                            .join(" ");
+                        
+                        // 覆盖原有的 List，存为 String
+                        map.insert("tags".to_string(), Value::String(tag_str));
+                    },
+                    // 如果它已经是 String，保持不变（或者是错的但我们暂且信任数据库）
+                    Value::String(_) => {}, 
+                    // 其他情况（如 null），删除或忽略
+                    _ => { map.remove("tags"); }
+                }
+            }
+
+            // 2. 强制覆盖关键字段
+            map.insert("title".to_string(), Value::String(self.title.clone()));
+            map.insert("revision".to_string(), Value::String(self.revision.to_string()));
+            
+            // 3. 【建议】添加 bag 字段，这对 syncer 很重要
+            // 默认情况下 TiddlyWiki 认为条目属于 "default" bag
+            map.entry("bag".to_string()).or_insert(Value::String("default".to_string()));
+        }
+
         meta
     }
 
@@ -385,11 +487,11 @@ struct Space {
 
 // TODO(nknight): Make this configurable (or support the features it describes).
 const STATUS: Status = Status {
-    username: "nknight",
+    username: "fiercex",
     anonymous: false,
     read_only: false,
     space: Space { recipe: "default" },
-    tiddlywiki_version: "5.2.2",
+    tiddlywiki_version: "5.3.8",
 };
 
 /// Return the server status as JSON.
