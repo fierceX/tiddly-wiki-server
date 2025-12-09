@@ -1,103 +1,90 @@
-# TiddlyWiki Server
+# TiddlyWiki Server (Rust Enhanced)
 
-[![Contributor Covenant](https://img.shields.io/badge/Contributor%20Covenant-2.1-4baaaa.svg)](code_of_conduct.md) 
+[![Contributor Covenant](https://img.shields.io/badge/Contributor%20Covenant-2.1-4baaaa.svg)](code_of_conduct.md)  
 
-This is an efficient, low-maintenance web server for [TiddlyWiki]. It uses the [web server
-API] provided by the [TiddlyWeb plugin] to save tiddlers in a [SQLite database]. It's written in Rust.
+[简体中文](./README_CN.md)  
+
+This is an efficient, low-maintenance, and feature-rich web server for [TiddlyWiki]. It is a fork of the original [tiddly-wiki-server](https://github.com/nknight/tiddly-wiki-server), rewritten in Rust to provide better performance, file management, and cloud integration.
+
+It uses the [web server API] provided by the [TiddlyWeb plugin] to save tiddlers in a [SQLite database], while offloading binary files to local storage or S3-compatible cloud storage.
 
 [TiddlyWiki]: https://tiddlywiki.com/
 [web server API]: https://tiddlywiki.com/#WebServer
 [SQLite database]: https://sqlite.org/index.html
 [TiddlyWeb plugin]: https://github.com/Jermolene/TiddlyWiki5/tree/master/plugins/tiddlywiki/tiddlyweb
 
-## Running the Server
+## Key Improvements & Features
 
-The easiest way to run `tiddly-wiki-server` is with Docker Compose. You can grab
-the [compose file](./docker-compose.yml) from this project and then start a
-server with 
+Compared to the original implementation, this fork includes significant enhancements:
 
-```sh
-docker compose up
+1.  **Optimized Wiki Rendering**: 
+    - The server now dynamically injects tiddlers into `empty.html` by splitting the template in memory. 
+    - Fixed issues where embedded plugins were not loading correctly in the original implementation.
+    
+2.  **Local File Offloading**:
+    - Binary files (images, PDFs, etc.) are **no longer stored as Base64 strings** inside the SQLite database.
+    - They are automatically saved to a local `files/` directory, and the Tiddler is updated with a `_canonical_uri` pointer. This keeps the database small and the wiki fast.
+
+3.  **S3/R2 Direct Upload Support**:
+    - Supports S3-compatible storage (e.g., AWS S3, Cloudflare R2).
+    - **Direct Upload**: The server generates a pre-signed PUT URL. The browser uploads the file directly to the cloud storage. Bandwidth is saved as files do not pass through the application server.
+
+4.  **Configuration & Logging**:
+    - Replaced command-line flags with a structured `config.toml` file.
+    - Configurable **Username** (displayed in the Wiki status).
+    - Integrated `tracing` for structured logging (configurable via `RUST_LOG`).
+
+## Configuration
+
+Create a `config.toml` file in the working directory.
+
+```toml
+[server]
+bind = "0.0.0.0"
+port = 3032
+db_path = "./data/tiddlers.sqlite3"
+files_dir = "./files/"
+
+[status]
+username = "YourName" 
+
+[s3]
+enable = true
+access_key = "YOUR_ACCESS_KEY"
+secret_key = "YOUR_SECRET_KEY"
+endpoint = "https://<ACCOUNT_ID>.r2.cloudflarestorage.com"
+region = "auto"
+bucket_name = "your-bucket"
+public_url_base = "https://your-public-domain.com"
 ```
 
-To run the server directly,
+## Running the Server
 
-1. Build or install the executable (e.g. by checking out this repository and
-   running `cargo install --path .`).
-1. Run the server:
-   ```sh
-   tiddly-wiki-server --bind 0.0.0.0 --port 3032 --dbpath ./tiddlers.sqlite
-   ```
+### Manual Installation
 
-If the database doesn't exit, `tiddly-wiki-server` will create and initialize
-it.
-
-See the `tiddly-wiki-server --help` for instructions on changing the bound
-address, port, database path, etc.
+1.  **Build**:
+    ```sh
+    cargo build --release
+    ```
+2.  **Run**:
+    Ensure `config.toml` and `empty.html` are in the correct path.
+    ```sh
+    ./target/release/tiddly-wiki-server --config config.toml
+    ```
 
 ## Motivation
 
-TiddlyWiki 5 has a [NodeJS based web server] that re-uses much of the front-end
-JavaScript for maximum compatibility. However, this server needs about 70 MB of
-memory to start, and can easily consume 100 MB or more. This is fine for running
-on a workstation, but a cheap VPS quickly gets crowded running services that size.
+TiddlyWiki 5 has a [NodeJS based web server] that is excellent but resource-heavy (often requiring 70MB+ RAM). This Rust implementation aims to provide the same functionality with a fraction of the footprint (approx. 10MB RAM), while adding modern features like S3 offloading which are typically complex to configure in the standard NodeJS version.
 
 [NodeJS based web server]: https://tiddlywiki.com/static/WebServer.html
 
-In rudimentary benchmarks it looks like `tiddly-wiki-server` uses about 10 MB of
-memory, which I find much more manageable. It's also easier to deploy!
-
-
 ## License
 
-This project is made available under [The Prosperity Public License 3.0.0],
-which gives you broad permissions for:
-
-* personal and not-for-profit use
-* reading and modifying the source code
-* trying out the software commercially
-
-but _doesn't_ let you build a business on the author's work.
-
-If you're uncertain if your use case might be infringing or you want to use it
-under a different license, reach out to @natknight.
-
-
-[The Prosperity Public License 3.0.0]: https://prosperitylicense.com/versions/3.0.0
-
-## Differences from TiddlyWiki
-
-The initial page that this project serves has a few changes compared to the
-empty wiki you can download from http://tiddlywiki.com/empty.html. It has:
-
-* the [TiddlyWeb plugin] to let TiddlyWiki save data to the server, and
-* any data that you entered or imported.
-* no `noscript` section for browsers that disable JavaScript (this is
-  considered a bug)
-
-This modified wiki was created by following this procedure:
-
-1. Download an empty TiddlyWiki from tiddlywiki.com/empty.html
-1. Add the TiddlyWeb plugin via the [plugin library]
-1. Add a `script` element to the very end of the HTML document with
-  - `class="tiddlywiki-tiddler-store"`
-  - `type="application/json`
-
-[plugin library]: https://tiddlywiki.com/static/Installing%2520a%2520plugin%2520from%2520the%2520plugin%2520library.html
-
-The empty wiki is then embedded in the `tiddly-wiki-server` binary; when the
-page is loaded, it inserts the stored tiddlers into the empty wiki and serves
-it. The result isn't _exactly_ what you'd get by loading the content into a
-regular TiddlyWiki and saving it, but it has all the same features, including
-that you can always download a copy and have a full, working TiddlyWiki with all
-of your tiddlers.
+This project is made available under [The Prosperity Public License 3.0.0].
 
 ## Contributing
 
-The most valuable way to contribute to this project is currently testing: try to
-setup a TiddlyWiki with it and see if it behaves the way you'd expect. The
-server aims to have feature parity with the first-party NodeJS server; any
-discrepancy is a potential bug, which I'd be very grateful to have reported!
+Pull requests are welcome. For major changes, please open an issue first to discuss what you would like to change.
 
 ## Code of Conduct
 
