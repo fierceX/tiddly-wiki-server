@@ -1,0 +1,18 @@
+[server]
+bind = "0.0.0.0"
+port = 3032
+db_path = "./data/tiddlers.sqlite3"
+files_dir = "./files/"
+
+[s3]
+enable = true
+access_key = "YOUR_ACCESS_KEY"
+secret_key = "YOUR_SECRET_KEY"
+endpoint = "https://<ACCOUNT_ID>.r2.cloudflarestorage.com"
+region = "auto"
+bucket_name = "test"
+public_url_base = "https://r2.example.com"
+
+[status]
+username = "FierceX"
+read_only = false
