@@ -13,15 +13,9 @@
 use aws_config::{meta::region::RegionProviderChain, BehaviorVersion};
 use aws_sdk_s3::{config::Credentials, config::Region, presigning::PresigningConfig, Client as S3Client};
 use axum::{
-    extract::{self, DefaultBodyLimit},
-    http::StatusCode,
-    routing::{delete, get, put},
-    Extension, Router,
-    middleware::{self, Next},
-    response::Response, 
-    http::{header},
-    extract::Request,
+    Extension, Router, extract::{self, DefaultBodyLimit, Request}, http::{StatusCode, header}, middleware::{self, Next}, response::Response, routing::{delete, get, post, put}
 };
+use chrono::Local;
 
 use clap::Parser;
 use serde::{Deserialize, Serialize};
@@ -168,6 +162,14 @@ struct PresignRequest {
 struct PresignResponse {
     upload_url: String,
     public_url: String,
+}
+
+// --- 新增：Inbox 请求结构 ---
+#[derive(Deserialize)]
+struct InboxRequest {
+    text: String,
+    #[serde(default)] // 如果客户端没传 tags 字段，默认为 None
+    tags: Option<String>,
 }
 
 // --- 预处理模板 ---
@@ -318,6 +320,7 @@ async fn main() {
         .route("/bags/default/tiddlers/{title}", delete(delete_tiddler))
         .route("/bags/efault/tiddlers/{title}", delete(delete_tiddler)) // 兼容旧客户端拼写错误
         .route("/api/sign-upload", get(get_presigned_url))
+        .route("/api/inbox", post(add_inbox_item))
         .nest_service("/files", files_service)
         .layer(Extension(datastore))
         .layer(Extension(config.server)) 
@@ -740,4 +743,54 @@ async fn auth_middleware(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(response)
+}
+
+// --- 新增：处理 Inbox 采集 ---
+async fn add_inbox_item(
+    Extension(ds): Extension<DataStore>,
+    extract::Json(payload): extract::Json<InboxRequest>,
+) -> AppResult<axum::Json<serde_json::Value>> {
+    let mut lock = ds.lock().await;
+    let tiddlers = &mut *lock;
+
+    // 1. 获取当前时间
+    let now = Local::now();
+    
+    // 2. 生成 TiddlyWiki 标准时间戳 (YYYYMMDDhhmmssXXX，精确到毫秒)
+    // TiddlyWiki 核心通常需要 17 位数字
+    let timestamp_str = now.format("%Y%m%d%H%M%S000").to_string();
+
+    // 3. 生成标题：Inbox + 可读时间 (防止标题冲突)
+    let title = format!("Inbox {}", now.format("%Y-%m-%d %H:%M:%S"));
+
+    // 4. 处理标签：强制加上 "Inbox" 标签，方便后续筛选
+    let final_tags = match payload.tags {
+        Some(t) if !t.is_empty() => format!("Inbox {}", t), // 如果用户传了标签，追加在后面
+        _ => "Inbox".to_string(),
+    };
+
+    // 5. 构建 Tiddler 数据
+    // 注意：type 默认为 text/vnd.tiddlywiki (也就是默认的 wikitext 格式)
+    let tiddler_json = serde_json::json!({
+        "title": title,
+        "text": payload.text,
+        "tags": final_tags,
+        "created": timestamp_str,
+        "modified": timestamp_str,
+        "type": "text/vnd.tiddlywiki"
+    });
+
+    // 6. 存入数据库
+    // 我们复用已有的 Tiddler::from_value 方法进行转换和校验
+    let tiddler = Tiddler::from_value(tiddler_json)?;
+    tiddlers.put(tiddler)?;
+
+    tracing::info!("📥 Inbox captured: {}", title);
+
+    // 7. 返回成功响应
+    Ok(axum::Json(serde_json::json!({
+        "status": "ok",
+        "title": title,
+        "created": timestamp_str
+    })))
 }

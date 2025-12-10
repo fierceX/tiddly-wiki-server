@@ -4,7 +4,7 @@
 
 [简体中文](./README_CN.md)  
 
-This is an efficient, low-maintenance, and feature-rich web server for [TiddlyWiki]. It is a fork of the original [tiddly-wiki-server](https://github.com/nknight/tiddly-wiki-server), rewritten in Rust to provide better performance, file management, and cloud integration.
+This is an efficient, low-maintenance, and feature-rich web server for [TiddlyWiki]. It is a fork of the original [tiddly-wiki-server](https://github.com/nknight/tiddly-wiki-server), rewritten in Rust to provide better performance, file management, cloud integration, and quick capture capabilities.
 
 It uses the [web server API] provided by the [TiddlyWeb plugin] to save tiddlers in a [SQLite database], while offloading binary files to local storage or S3-compatible cloud storage.
 
@@ -29,14 +29,19 @@ Compared to the original implementation, this fork includes significant enhancem
     - Supports S3-compatible storage (e.g., AWS S3, Cloudflare R2).
     - **Direct Upload**: The server generates a pre-signed PUT URL. The browser uploads the file directly to the cloud storage. Bandwidth is saved as files do not pass through the application server.
 
-4.  **Configuration & Logging**:
-    - Replaced command-line flags with a structured `config.toml` file.
-    - Configurable **Username** (displayed in the Wiki status).
-    - Integrated `tracing` for structured logging (configurable via `RUST_LOG`).
+4.  **Basic Authentication**:
+    - Built-in HTTP Basic Auth middleware.
+    - Protects your wiki from unauthorized access when deployed on public networks.
+
+5.  **Quick Capture (Inbox) API**:
+    - A specialized Webhook endpoint (`/api/inbox`) designed for mobile automation.
+    - Easily integrates with **iOS Shortcuts**, **Android HTTP Shortcuts** to save thoughts to your wiki instantly without loading the full interface.
 
 ## Configuration
 
 Create a `config.toml` file in the working directory.
+
+> **Security Note**: When using Basic Auth (`[auth]`), it is highly recommended to run this server behind a reverse proxy (like Nginx/Caddy) with **HTTPS** enabled, as credentials are sent in Base64 encoding.
 
 ```toml
 [server]
@@ -45,8 +50,15 @@ port = 3032
 db_path = "./data/tiddlers.sqlite3"
 files_dir = "./files/"
 
+# Display name for edits in the Wiki
 [status]
 username = "YourName" 
+
+# [Optional] HTTP Basic Authentication
+# If omitted, the server runs without password protection.
+[auth]
+username = "admin"
+password = "change_me_please"
 
 [s3]
 enable = true
@@ -57,6 +69,45 @@ region = "auto"
 bucket_name = "your-bucket"
 public_url_base = "https://your-public-domain.com"
 ```
+
+## Quick Capture API (Inbox)
+
+This server exposes a lightweight endpoint to capture thoughts from external tools.
+
+- **Endpoint**: `POST /api/inbox`
+- **Auth**: Requires HTTP Basic Auth (if configured).
+- **Content-Type**: `application/json`
+
+### JSON Payload
+
+```json
+{
+  "text": "This is a quick thought captured from my phone.",
+  "tags": "idea mobile" 
+}
+```
+*`tags` is optional. If omitted, it defaults to just "Inbox".*
+
+### Integration Examples
+
+#### 1. curl (Command Line)
+```bash
+curl -X POST https://your-wiki.com/api/inbox \
+     -u "admin:change_me_please" \
+     -H "Content-Type: application/json" \
+     -d '{"text": "Hello form terminal!", "tags": "cli"}'
+```
+
+#### 2. iOS Shortcuts / Android HTTP Shortcuts
+Configure your shortcut app with the following settings:
+*   **URL**: `https://your-wiki.com/api/inbox`
+*   **Method**: `POST`
+*   **Headers**: 
+    *   `Authorization`: `Basic <Base64_Encoded_Credentials>` (e.g., `Basic YWRtaW46MTIzNDU2`)
+*   **Body**: JSON
+    *   `text`: (Select "Ask Each Time" or Clipboard)
+
+Captured items will appear in your Wiki with the tag `Inbox` and a timestamped title.
 
 ## Running the Server
 
@@ -74,7 +125,7 @@ public_url_base = "https://your-public-domain.com"
 
 ## Motivation
 
-TiddlyWiki 5 has a [NodeJS based web server] that is excellent but resource-heavy (often requiring 70MB+ RAM). This Rust implementation aims to provide the same functionality with a fraction of the footprint (approx. 10MB RAM), while adding modern features like S3 offloading which are typically complex to configure in the standard NodeJS version.
+TiddlyWiki 5 has a [NodeJS based web server] that is excellent but resource-heavy (often requiring 70MB+ RAM). This Rust implementation aims to provide the same functionality with a fraction of the footprint (approx. 10MB RAM), while adding modern features like S3 offloading and mobile quick capture which are typically complex to configure in the standard NodeJS version.
 
 [NodeJS based web server]: https://tiddlywiki.com/static/WebServer.html
 

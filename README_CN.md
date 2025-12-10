@@ -1,11 +1,15 @@
-
 # TiddlyWiki Server (Rust 增强版)
 
 [![Contributor Covenant](https://img.shields.io/badge/Contributor%20Covenant-2.1-4baaaa.svg)](code_of_conduct.md)
 
-这是一个高效、低维护成本且功能丰富的 [TiddlyWiki] Web 服务器。它是原版 [tiddly-wiki-server](https://github.com/nknight/tiddly-wiki-server) 的 Rust 重构增强版，旨在提供更好的性能、文件管理和云存储集成体验。
+这是一个高效、低维护成本且功能丰富的 [TiddlyWiki] Web 服务器。它是原版 [tiddly-wiki-server](https://github.com/nknight/tiddly-wiki-server) 的 Rust 重构增强版，旨在提供更好的性能、文件管理、云存储集成以及便捷的数据采集体验。
 
 它利用 [TiddlyWeb plugin] 提供的 [Web Server API]，将条目（Tiddlers）保存在 [SQLite 数据库] 中，同时支持将大文件剥离存储到本地文件系统或 S3 云存储中。
+
+[TiddlyWiki]: https://tiddlywiki.com/
+[web server API]: https://tiddlywiki.com/#WebServer
+[SQLite database]: https://sqlite.org/index.html
+[TiddlyWeb plugin]: https://github.com/Jermolene/TiddlyWiki5/tree/master/plugins/tiddlywiki/tiddlyweb
 
 ## 主要改进与特性
 
@@ -23,14 +27,19 @@
     - 支持 S3 兼容的对象存储（如 AWS S3, Cloudflare R2）。
     - **前端直传**: 服务器仅负责生成预签名 URL (Presigned URL)，浏览器直接将文件上传至云存储。这不仅减轻了服务器带宽压力，还提高了上传稳定性。
 
-4.  **配置化与日志**:
-    - 引入 `config.toml` 配置文件，告别繁琐的命令行参数。
-    - 支持自定义 **Username**（显示在 Wiki 状态栏）。
-    - 增加了结构化日志输出（基于 `tracing`），便于排查问题。
+4.  **基础鉴权 (Basic Authentication)**:
+    - 内置 HTTP Basic Auth 中间件。
+    - 在公网部署时，可通过配置账号密码保护您的 Wiki 不被未授权访问。
+
+5.  **快速采集 (Inbox) API**:
+    - 专为移动端自动化设计的 Webhook 接口 (`/api/inbox`)。
+    - 可轻松集成 **iOS 快捷指令**、**Android HTTP Shortcuts** 无需加载完整网页即可随时记录灵感。
 
 ## 配置文件说明
 
 请在运行目录下创建 `config.toml` 文件：
+
+> **安全提示**: 当启用 Basic Auth (`[auth]`) 时，强烈建议配合反向代理（如 Nginx/Caddy）并开启 **HTTPS** 使用，因为密码是通过 Base64 编码明文传输的。
 
 ```toml
 [server]
@@ -42,6 +51,12 @@ files_dir = "./files/"        # 本地文件存储路径
 [status]
 username = "FierceX"          # Wiki 中显示的用户名
 
+# [可选] HTTP 基础鉴权
+# 如果注释掉此部分，服务器将无密码运行
+[auth]
+username = "admin"
+password = "change_me_please"
+
 [s3]
 enable = true                 # 是否启用 S3 上传
 access_key = "YOUR_ACCESS_KEY"
@@ -51,6 +66,45 @@ region = "auto"
 bucket_name = "your-bucket"
 public_url_base = "https://your-public-domain.com" # 文件的公开访问前缀
 ```
+
+## 快速采集 API (Inbox)
+
+本服务器暴露了一个轻量级的 Webhook 接口，用于从外部工具快速捕捉想法。
+
+- **接口地址**: `POST /api/inbox`
+- **鉴权**: 需要 HTTP Basic Auth（如果配置中启用了的话）。
+- **Content-Type**: `application/json`
+
+### JSON 数据格式
+
+```json
+{
+  "text": "这是一条来自手机的灵感记录。",
+  "tags": "idea mobile" 
+}
+```
+*`tags` 是可选的。如果省略，默认标签为 "Inbox"。*
+
+### 集成示例
+
+#### 1. curl (命令行)
+```bash
+curl -X POST https://your-wiki.com/api/inbox \
+     -u "admin:change_me_please" \
+     -H "Content-Type: application/json" \
+     -d '{"text": "来自终端的问候！", "tags": "cli"}'
+```
+
+#### 2. iOS 快捷指令 / Android HTTP Shortcuts
+在您的快捷指令 App 中配置以下参数：
+*   **URL**: `https://your-wiki.com/api/inbox`
+*   **方法 (Method)**: `POST`
+*   **头部 (Headers)**: 
+    *   `Authorization`: `Basic <Base64编码的账号密码>` (例如: `Basic YWRtaW46MTIzNDU2`)
+*   **请求体 (Body)**: JSON
+    *   `text`: (选择 "每次询问" 或 "剪贴板")
+
+采集到的条目将出现在您的 Wiki 中，带有 `Inbox` 标签和以时间戳命名的标题。
 
 ## 运行服务器
 
@@ -68,7 +122,9 @@ public_url_base = "https://your-public-domain.com" # 文件的公开访问前缀
 
 ## 项目初衷
 
-TiddlyWiki 5 官方的 [NodeJS server] 虽然兼容性极佳，但资源占用较高（通常需要 70MB+ 内存）。这个 Rust 版本旨在以极低的资源占用（约 10MB 内存）提供相同的功能，并增加了 S3 直传等现代功能，使其更适合在廉价 VPS 或个人服务器上部署。
+TiddlyWiki 5 官方的 [NodeJS server] 虽然兼容性极佳，但资源占用较高（通常需要 70MB+ 内存）。这个 Rust 版本旨在以极低的资源占用（约 10MB 内存）提供相同的功能，并增加了 S3 直传、移动端快速采集等现代功能，使其更适合在廉价 VPS 或个人服务器上部署。
+
+[NodeJS server]: https://tiddlywiki.com/static/WebServer.html
 
 ## 许可证
 
