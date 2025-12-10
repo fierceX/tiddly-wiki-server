@@ -17,7 +17,12 @@ use axum::{
     http::StatusCode,
     routing::{delete, get, put},
     Extension, Router,
+    middleware::{self, Next},
+    response::Response, 
+    http::{header},
+    extract::Request,
 };
+
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -31,13 +36,13 @@ use std::{
 use tokio::fs;
 use tokio::sync::Mutex;
 use tower_http::{services::ServeDir, trace::TraceLayer};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use tracing_subscriber::{EnvFilter, layer::{self, SubscriberExt}, util::SubscriberInitExt};
 use base64::{engine::general_purpose, Engine as _};
+use tower_http::compression::CompressionLayer;
 
 type DataStore = Arc<Mutex<Tiddlers>>;
 
 // --- 配置结构定义 ---
-
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -52,6 +57,7 @@ struct AppConfig {
     s3: S3Config,
     #[serde(default = "default_status_config")] 
     status: Status, 
+    auth: Option<AuthConfig>, 
 }
 
 fn default_status_config() -> Status {
@@ -120,6 +126,13 @@ struct S3Config {
     region: String,
     bucket_name: String,
     public_url_base: String,
+}
+
+// [新增] 账号密码结构
+#[derive(Deserialize, Debug, Clone)]
+struct AuthConfig {
+    username: String,
+    password: String,
 }
 
 // --- 应用状态 ---
@@ -299,22 +312,23 @@ async fn main() {
         .route("/status", get(status))
         .route("/recipes/default/tiddlers.json", get(all_tiddlers))
         .route(
-            "/recipes/default/tiddlers/:title",
+            "/recipes/default/tiddlers/{title}",
             put(put_tiddler).get(get_tiddler),
         )
-        .route("/bags/default/tiddlers/:title", delete(delete_tiddler))
-        .route("/bags/efault/tiddlers/:title", delete(delete_tiddler)) // 兼容旧客户端拼写错误
+        .route("/bags/default/tiddlers/{title}", delete(delete_tiddler))
+        .route("/bags/efault/tiddlers/{title}", delete(delete_tiddler)) // 兼容旧客户端拼写错误
         .route("/api/sign-upload", get(get_presigned_url))
         .nest_service("/files", files_service)
         .layer(Extension(datastore))
-        .layer(Extension(config.server)) // 传入 ServerConfig
+        .layer(Extension(config.server)) 
         .layer(Extension(template))
         .layer(Extension(app_state))
         .layer(Extension(Arc::new(config.status)))
         .layer(DefaultBodyLimit::max(20 * 1024 * 1024))
-        // 关键：添加 HTTP 请求日志追踪层
-        .layer(TraceLayer::new_for_http());
-
+        .layer(TraceLayer::new_for_http())
+        .layer(CompressionLayer::new().gzip(true).br(true).zstd(true))
+        .layer(middleware::from_fn(auth_middleware))
+        .layer(Extension(config.auth));
     tracing::info!("TiddlyWiki server listening on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(&addr)
@@ -373,7 +387,7 @@ fn initialize_datastore(config: &ServerConfig) -> AppResult<DataStore> {
 }
 
 // -----------------------------------------------------------------------------------
-// Handlers (大部分保持不变，稍微修改了参数提取以匹配新的 Config 结构)
+// Handlers
 
 async fn render_wiki(
     Extension(ds): Extension<DataStore>,
@@ -519,7 +533,7 @@ async fn put_tiddler(
 }
 
 // -----------------------------------------------------------------------------------
-// Models (保持不变)
+// Models
 pub(crate) struct Tiddlers {
     cxn: rusqlite::Connection,
 }
@@ -682,4 +696,48 @@ impl From<rusqlite::Error> for AppError {
         tracing::error!("{:?}", err);
         AppError::Database(err.to_string())
     }
+}
+
+async fn auth_middleware(
+    Extension(auth_config): Extension<Option<AuthConfig>>,
+    req: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    // 1. 如果配置中没有 auth 部分，直接放行 (允许无密码运行)
+    let auth = match auth_config {
+        Some(config) => config,
+        None => return Ok(next.run(req).await),
+    };
+
+    // 2. 获取请求头中的 Authorization
+    let auth_header = req.headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| h.strip_prefix("Basic "));
+
+    // 3. 验证账号密码
+    if let Some(encoded) = auth_header {
+        // 解码 Base64
+        if let Ok(decoded) = general_purpose::STANDARD.decode(encoded) {
+            if let Ok(creds) = String::from_utf8(decoded) {
+                // 格式通常是 "username:password"
+                if let Some((u, p)) = creds.split_once(':') {
+                    if u == auth.username && p == auth.password {
+                        // 验证通过，继续处理请求
+                        return Ok(next.run(req).await);
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. 验证失败或未提供 Header，返回 401 并触发浏览器弹窗
+    tracing::warn!("Unauthorized access attempt");
+    let response = Response::builder()
+        .status(StatusCode::UNAUTHORIZED)
+        .header("WWW-Authenticate", "Basic realm=\"TiddlyWiki Server\"")
+        .body(axum::body::Body::empty())
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(response)
 }
