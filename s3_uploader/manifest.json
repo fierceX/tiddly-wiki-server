@@ -1,0 +1,22 @@
+{
+  "title": "$:/plugins/custom/s3-uploader",
+  "name": "S3 Uploader",
+  "description": "S3 Lazy Uploader backed by Rust",
+  "author": "fiercex",
+  "version": "1.0.1",
+  "plugin-type": "plugin",
+  "tiddlers": [
+    {
+      "title": "$:/plugins/custom/s3-uploader/ui-modal",
+      "file": "ui-modal.html",
+      "subtitle": "Confirm S3 Upload",
+      "footer": "<$button message=\"tm-close-tiddler\" class=\"tc-btn-invisible tc-tiddlylink\">Cancel</$button><$button message=\"tm-s3-confirm-upload\" class=\"tc-btn-big-green\" actions=\"<$action-sendmessage $message='tm-close-tiddler'/>\">Import to S3</$button>"
+    },
+    {
+      "title": "$:/plugins/custom/s3-uploader.js",
+      "file": "s3-uploader.js",
+      "type": "application/javascript",
+      "module-type": "startup"
+    }
+  ]
+}

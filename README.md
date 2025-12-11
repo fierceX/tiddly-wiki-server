@@ -1,12 +1,14 @@
 # TiddlyWiki Server (Rust Enhanced)
 
-[![Contributor Covenant](https://img.shields.io/badge/Contributor%20Covenant-2.1-4baaaa.svg)](code_of_conduct.md)  
+[![Contributor Covenant](https://img.shields.io/badge/Contributor%20Covenant-2.1-4baaaa.svg)](code_of_conduct.md)
+![Rust Version](https://img.shields.io/badge/rust-1.75%2B-orange)
+![License](https://img.shields.io/badge/license-Prosperity%20Public-blue)
 
-[简体中文](./README_CN.md)  
+[简体中文](./README_CN.md)
 
 This is an efficient, low-maintenance, and feature-rich web server for [TiddlyWiki]. It is a fork of the original [tiddly-wiki-server](https://github.com/nknight/tiddly-wiki-server), rewritten in Rust to provide better performance, file management, cloud integration, and quick capture capabilities.
 
-It uses the [web server API] provided by the [TiddlyWeb plugin] to save tiddlers in a [SQLite database], while offloading binary files to local storage or S3-compatible cloud storage.
+It uses the [web server API] provided by the [TiddlyWeb plugin] to save tiddlers in a [SQLite database], while smartly offloading binary files to local storage or S3-compatible cloud storage.
 
 [TiddlyWiki]: https://tiddlywiki.com/
 [web server API]: https://tiddlywiki.com/#WebServer
@@ -17,31 +19,31 @@ It uses the [web server API] provided by the [TiddlyWeb plugin] to save tiddlers
 
 Compared to the original implementation, this fork includes significant enhancements:
 
-1.  **Optimized Wiki Rendering**: 
-    - The server now dynamically injects tiddlers into `empty.html` by splitting the template in memory. 
-    - Fixed issues where embedded plugins were not loading correctly in the original implementation.
-    
-2.  **Local File Offloading**:
-    - Binary files (images, PDFs, etc.) are **no longer stored as Base64 strings** inside the SQLite database.
-    - They are automatically saved to a local `files/` directory, and the Tiddler is updated with a `_canonical_uri` pointer. This keeps the database small and the wiki fast.
+### 🚀 Performance & Rendering
+- **Optimized Wiki Rendering**: Dynamically injects tiddlers into `empty.html` via efficient memory splitting.
+- **Low Footprint**: Runs with approx. 10MB RAM, compared to 70MB+ for the standard NodeJS server.
 
-3.  **S3/R2 Direct Upload Support**:
-    - Supports S3-compatible storage (e.g., AWS S3, Cloudflare R2).
-    - **Direct Upload**: The server generates a pre-signed PUT URL. The browser uploads the file directly to the cloud storage. Bandwidth is saved as files do not pass through the application server.
+### ☁️ Smart Storage (S3 & Local)
+- **Local File Offloading**: Binary files (images, PDFs) are kept out of the SQLite database to ensure speed. They are stored in `files/`, and Tiddlers simply reference them via `_canonical_uri`.
+- **S3/R2 Direct Upload**: 
+    - Generates pre-signed URLs for secure, direct browser-to-cloud uploads.
+    - Saves server bandwidth and supports huge files.
+- **Metadata-Driven Robustness**: Tiddlers store storage metadata (Bucket, Key, Region) directly in their fields (`_s3_key`, etc.). This means file management remains accurate even if server configurations change.
+- **Cascade Delete**: When you delete a Tiddler in the Wiki, the server **automatically cleans up** the corresponding file on S3 or the local disk. No more orphaned files!
 
-4.  **Basic Authentication**:
-    - Built-in HTTP Basic Auth middleware.
-    - Protects your wiki from unauthorized access when deployed on public networks.
+### 🔒 Security & Auth
+- **Basic Authentication**: Built-in HTTP Basic Auth middleware to protect your wiki on public networks.
+- **Authorization Headers**: Supports standard `Authorization` headers for API integration.
 
-5.  **Quick Capture (Inbox) API**:
-    - A specialized Webhook endpoint (`/api/inbox`) designed for mobile automation.
-    - Easily integrates with **iOS Shortcuts**, **Android HTTP Shortcuts** to save thoughts to your wiki instantly without loading the full interface.
+### 📥 Quick Capture (Inbox)
+- A specialized Webhook endpoint (`/api/inbox`) designed for mobile automation.
+- Easily integrates with **iOS Shortcuts** or **Android HTTP Shortcuts** to capture thoughts instantly without loading the full interface.
 
 ## Configuration
 
 Create a `config.toml` file in the working directory.
 
-> **Security Note**: When using Basic Auth (`[auth]`), it is highly recommended to run this server behind a reverse proxy (like Nginx/Caddy) with **HTTPS** enabled, as credentials are sent in Base64 encoding.
+> **Security Note**: When using Basic Auth, it is highly recommended to run this server behind a reverse proxy (like Nginx/Caddy) with **HTTPS** enabled.
 
 ```toml
 [server]
@@ -55,27 +57,26 @@ files_dir = "./files/"
 username = "YourName" 
 
 # [Optional] HTTP Basic Authentication
-# If omitted, the server runs without password protection.
 [auth]
 username = "admin"
 password = "change_me_please"
 
 [s3]
 enable = true
-access_key = "YOUR_ACCESS_KEY"
-secret_key = "YOUR_SECRET_KEY"
+name = "r2"
+access_key = "YOUR_AWS_ACCESS_KEY"
+secret_key = "YOUR_AWS_SECRET_KEY"
 endpoint = "https://<ACCOUNT_ID>.r2.cloudflarestorage.com"
 region = "auto"
-bucket_name = "your-bucket"
-public_url_base = "https://your-public-domain.com"
+bucket_name = "your-wiki-assets"
+public_url_base = "https://assets.your-domain.com"
 ```
 
 ## Quick Capture API (Inbox)
 
-This server exposes a lightweight endpoint to capture thoughts from external tools.
+Capture thoughts from external tools without opening the wiki.
 
 - **Endpoint**: `POST /api/inbox`
-- **Auth**: Requires HTTP Basic Auth (if configured).
 - **Content-Type**: `application/json`
 
 ### JSON Payload
@@ -86,48 +87,42 @@ This server exposes a lightweight endpoint to capture thoughts from external too
   "tags": "idea mobile" 
 }
 ```
-*`tags` is optional. If omitted, it defaults to just "Inbox".*
+*`tags` is optional. Default: "Inbox".*
 
-### Integration Examples
-
-#### 1. curl (Command Line)
-```bash
-curl -X POST https://your-wiki.com/api/inbox \
-     -u "admin:change_me_please" \
-     -H "Content-Type: application/json" \
-     -d '{"text": "Hello form terminal!", "tags": "cli"}'
-```
-
-#### 2. iOS Shortcuts / Android HTTP Shortcuts
-Configure your shortcut app with the following settings:
+### iOS / Android Shortcut Example
 *   **URL**: `https://your-wiki.com/api/inbox`
 *   **Method**: `POST`
-*   **Headers**: 
-    *   `Authorization`: `Basic <Base64_Encoded_Credentials>` (e.g., `Basic YWRtaW46MTIzNDU2`)
-*   **Body**: JSON
-    *   `text`: (Select "Ask Each Time" or Clipboard)
+*   **Headers**: `Authorization: Basic <Base64_Credentials>`
+*   **Body**: JSON (Pass clipboard or input as `text`)
 
 Captured items will appear in your Wiki with the tag `Inbox` and a timestamped title.
 
-## Running the Server
-
-### Manual Installation
+## Installation & Running
 
 1.  **Build**:
     ```sh
     cargo build --release
     ```
 2.  **Run**:
-    Ensure `config.toml` and `empty.html` are in the correct path.
+    Ensure `config.toml` and `empty.html` are in the directory.
     ```sh
     ./target/release/tiddly-wiki-server --config config.toml
     ```
 
-## Motivation
+## Development: Modifying the Embedded Plugin
 
-TiddlyWiki 5 has a [NodeJS based web server] that is excellent but resource-heavy (often requiring 70MB+ RAM). This Rust implementation aims to provide the same functionality with a fraction of the footprint (approx. 10MB RAM), while adding modern features like S3 offloading and mobile quick capture which are typically complex to configure in the standard NodeJS version.
+This server embeds a custom TiddlyWiki plugin (`s3-uploader`) handling the drag-and-drop logic. If you want to modify the JavaScript or HTML of the uploader:
 
-[NodeJS based web server]: https://tiddlywiki.com/static/WebServer.html
+1.  Navigate to the `s3_uploader/` directory.
+2.  Edit `s3-uploader.js` (logic) or `ui-modal.html` (UI) directly.
+3.  **Repack the plugin** using the included tool:
+
+    ```sh
+    # Re-generates s3_uploader_plugin.json from source files
+    cargo run --bin pack_plugin -- ./s3_uploader/manifest.json ./s3_uploader_plugin.json
+    ```
+
+4.  Rebuild the server (`cargo build`) to embed the changes.
 
 ## License
 

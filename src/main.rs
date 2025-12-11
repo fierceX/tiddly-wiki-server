@@ -114,6 +114,7 @@ struct ServerConfig {
 #[derive(Deserialize, Debug, Clone)]
 struct S3Config {
     enable: bool,
+    name:String,
     access_key: String,
     secret_key: String,
     endpoint: String,
@@ -133,6 +134,7 @@ struct AuthConfig {
 
 #[derive(Clone)]
 struct AppState {
+    s3_name:String,
     s3_client: Option<S3Client>, // 设为 Option，允许不启用 S3
     bucket_name: String,
     public_url_base: String,
@@ -162,6 +164,10 @@ struct PresignRequest {
 struct PresignResponse {
     upload_url: String,
     public_url: String,
+    name:String,
+    key: String,       
+    bucket: String,
+    region: String,
 }
 
 // --- 新增：Inbox 请求结构 ---
@@ -227,9 +233,15 @@ async fn get_presigned_url(
     let upload_url = presigned_req.uri().to_string();
     let public_url = format!("{}/{}", state.public_url_base, safe_key);
 
+    let region = client.config().region().map(|r| r.as_ref()).unwrap_or("default").to_string();
+
     Ok(axum::Json(PresignResponse {
         upload_url,
         public_url,
+        name:state.s3_name.clone(),
+        key: safe_key,
+        bucket: state.bucket_name.clone(),
+        region,
     }))
 }
 
@@ -300,6 +312,7 @@ async fn main() {
     };
 
     let app_state = Arc::new(AppState {
+        s3_name:config.s3.name.clone(),
         s3_client,
         bucket_name: config.s3.bucket_name.clone(),
         public_url_base: config.s3.public_url_base.clone(),
@@ -454,18 +467,127 @@ async fn get_tiddler(
 
 async fn delete_tiddler(
     Extension(ds): Extension<DataStore>,
+    Extension(state): Extension<Arc<AppState>>,
+    Extension(config): Extension<ServerConfig>,
     extract::Path(title): extract::Path<String>,
 ) -> AppResult<axum::response::Response<String>> {
     let mut lock = ds.lock().await;
     let tiddlers = &mut *lock;
-    tiddlers.pop(&title)?;
-    
+    let deleted_tiddler = tiddlers.pop(&title)?;
+    drop(lock);
+    // tiddlers.pop(&title)?;
+    // 如果成功删除了条目，检查是否有关联文件需要删除
+    if let Some(tiddler) = deleted_tiddler {
+        // 这里我们使用 tokio::spawn 异步后台删除，不阻塞 HTTP 响应
+        // 如果你希望确认文件删除后再返回，可以去掉 spawn 直接 await
+        tokio::spawn(async move {
+            try_delete_associated_file(tiddler, state, config).await;
+        });
+    }
     // 记录删除操作
     tracing::info!("Deleted tiddler: {}", title);
 
     let mut resp = axum::response::Response::default();
     *resp.status_mut() = StatusCode::NO_CONTENT;
     Ok(resp)
+}
+
+async fn try_delete_associated_file(tiddler: Tiddler, state: Arc<AppState>, config: ServerConfig) {
+    // 1. 尝试从 meta 中提取 _canonical_uri
+    // Tiddler 的 JSON 结构中，字段可能在顶层，也可能在 'fields' 对象里
+    let uri = match tiddler.meta.get("_canonical_uri") {
+        Some(Value::String(s)) => Some(s.as_str()),
+        _ => tiddler.meta.get("fields")
+            .and_then(|f| f.get("_canonical_uri"))
+            .and_then(|v| v.as_str())
+    };
+
+    let uri = match uri {
+        Some(u) => u,
+        None => return, // 没有外部文件链接，直接返回
+    };
+
+    let get_field = |key: &str| -> Option<String> {
+        tiddler.meta.get(key)
+            .or_else(|| tiddler.meta.get("fields").and_then(|f| f.get(key)))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    };
+
+    tracing::debug!("Found associated file URI: {}", uri);
+
+    // 1. 优先检查 _file_storage 标记
+    let storage_type = get_field("_file_storage");
+
+    // === 分支 A: 明确标记为 S3 存储 ===
+    if storage_type.as_deref() == Some("s3") {
+        if let Some(client) = &state.s3_client {
+            // 获取 bucket 和 key，如果字段不存在则无法删除
+            let bucket = get_field("_s3_bucket").unwrap_or_else(|| state.bucket_name.clone());
+            let key = match get_field("_s3_key") {
+                Some(k) => k,
+                None => {
+                    tracing::warn!("Tiddler marked as S3 but missing _s3_key: {}", tiddler.title);
+                    return;
+                }
+            };
+            
+            tracing::info!("Deleting S3 Object (Self-Described) -> Bucket: {}, Key: {}", bucket, key);
+            
+            //即使配置文件的 bucket 变了，我们也删除 Tiddler 中记录的那个 bucket 里的文件
+            let _ = client.delete_object()
+                .bucket(&bucket)
+                .key(&key)
+                .send()
+                .await
+                .map_err(|e| tracing::error!("Failed to delete S3 object: {}", e));
+        }
+        return;
+    }
+
+    let uri = match get_field("_canonical_uri") {
+        Some(u) => u,
+        None => return,
+    };
+    
+    // === 分支 B: 明确标记为 Local 存储 ===
+    if storage_type.as_deref() == Some("local") {
+        // 本地存储逻辑（略，你可以像 put_tiddler 里那样存 _file_storage="local"）
+        // ... (原有的本地文件删除逻辑) ...
+        let filename = &uri["/files/".len()..];
+        if filename.contains("..") || filename.contains('/') || filename.contains('\\') { return; }
+        let file_path = config.files_dir.join(filename);
+        let _ = fs::remove_file(&file_path).await;
+        tracing::info!("Deleted local file (Self-Described): {:?}", file_path);
+        return;
+    }
+
+    // === 分支 C: 兼容旧数据 (Legacy) ===
+    // 如果没有 _file_storage 字段，回退到基于 _canonical_uri 解析的逻辑
+    
+    if uri.starts_with("/files/") {
+        // ... (原有的本地文件删除逻辑) ...
+        let filename = &uri["/files/".len()..];
+        if filename.contains("..") || filename.contains('/') || filename.contains('\\') { return; }
+        let file_path = config.files_dir.join(filename);
+        let _ = fs::remove_file(&file_path).await;
+        tracing::info!("Deleted local file (Legacy detection): {:?}", file_path);
+    } 
+    else if state.s3_client.is_some() && uri.starts_with(&state.public_url_base) {
+        // ... (原有的 S3 删除逻辑，依赖 config.toml 中的 public_url_base) ...
+        let client = state.s3_client.as_ref().unwrap();
+        let mut key = &uri[state.public_url_base.len()..];
+        if key.starts_with('/') { key = &key[1..]; }
+        
+        tracing::info!("Deleting S3 Object (Legacy URI match) -> Bucket: {}, Key: {}", state.bucket_name, key);
+        
+        let _ = client.delete_object()
+            .bucket(&state.bucket_name)
+            .key(key)
+            .send()
+            .await
+            .map_err(|e| tracing::error!("Failed to delete S3 object: {}", e));
+    }
 }
 
 async fn put_tiddler(
@@ -509,6 +631,7 @@ async fn put_tiddler(
                                 obj.insert("text".to_string(), serde_json::Value::String("".to_string()));
                                 let uri = format!("/files/{}", filename);
                                 obj.insert("_canonical_uri".to_string(), serde_json::Value::String(uri));
+                                obj.insert("_file_storage".to_string(), serde_json::Value::String("local".to_string()));
                                 tracing::info!("Offloaded binary file for '{}' to {}", title, file_path.display());
                             }
                         }
