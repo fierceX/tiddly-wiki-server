@@ -1,18 +1,27 @@
 [server]
 bind = "0.0.0.0"
 port = 3032
-db_path = "./data/tiddlers.sqlite3"
-files_dir = "./files/"
+db_path = "./data/tiddlers.sqlite3"  # 数据库存储路径
+files_dir = "./files/"               # 本地文件存储路径
+
+# 在 Wiki 修订记录中显示的用户名
+[status]
+username = "YourName" 
+
+# [可选] HTTP 基础认证
+# 如果注释掉此部分，服务器将允许匿名访问
+[auth]
+username = "admin"
+password = "change_me_please"
 
 [s3]
 enable = true
-access_key = "YOUR_ACCESS_KEY"
-secret_key = "YOUR_SECRET_KEY"
+name = "r2"
+access_key = "YOUR_AWS_ACCESS_KEY"
+secret_key = "YOUR_AWS_SECRET_KEY"
+# 示例：Cloudflare R2 的 endpoint
 endpoint = "https://<ACCOUNT_ID>.r2.cloudflarestorage.com"
 region = "auto"
-bucket_name = "test"
-public_url_base = "https://r2.example.com"
-
-[status]
-username = "FierceX"
-read_only = false
+bucket_name = "your-wiki-assets"
+# 你的资源公开访问域名
+public_url_base = "https://assets.your-domain.com"
