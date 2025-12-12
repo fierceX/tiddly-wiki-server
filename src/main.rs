@@ -18,6 +18,8 @@ use axum::{
 use chrono::Local;
 
 use clap::Parser;
+use rusqlite::params;
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -353,6 +355,30 @@ async fn main() {
     axum::serve(listener, app).await.expect("Error serving app");
 }
 
+fn insert_default_data(str:&str,conn: &Connection) -> Result<(), AppError> {
+    tracing::info!("Installing plugin...");
+    let v: serde_json::Value = serde_json::from_str(str)
+        .map_err(|e| AppError::Serialization(format!("Invalid plugin json: {}", e)))?;
+    
+    let plugin_obj = if let serde_json::Value::Array(arr) = &v {
+        arr.first().ok_or(AppError::Serialization("Empty json array".into()))?
+    } else {
+        &v
+    };
+
+    let tiddler = Tiddler::from_value(plugin_obj.clone())?;
+    let mut stmt = conn.prepare(
+        "INSERT INTO tiddlers (title, revision, meta) VALUES (:title, :revision, :meta)"
+    ).map_err(AppError::from)?;
+    
+    stmt.execute(rusqlite::named_params! {
+        ":title": tiddler.title,
+        ":revision": tiddler.revision,
+        ":meta": tiddler.meta,
+    }).map_err(AppError::from)?;
+    Ok(())
+}
+
 fn initialize_datastore(config: &ServerConfig) -> AppResult<DataStore> {
     // 确保数据目录存在
     if let Some(parent) = config.db_path.parent() {
@@ -362,42 +388,41 @@ fn initialize_datastore(config: &ServerConfig) -> AppResult<DataStore> {
     // 确保文件目录存在
     std::fs::create_dir_all(&config.files_dir).map_err(|e| AppError::Database(e.to_string()))?;
 
-    let init_script = include_str!("./init.sql");
-    let cxn = rusqlite::Connection::open(&config.db_path).map_err(AppError::from)?;
-    cxn.execute_batch(init_script).map_err(AppError::from)?;
+    // 检查数据库文件是否存在
+    let db_exists = config.db_path.exists();
 
-    const PLUGIN_JSON: &str = include_str!("../s3_uploader_plugin.json");
-    let plugin_title = "$:/plugins/custom/s3-uploader";
-    
-    let exists: bool = cxn.query_row(
-        "SELECT exists(SELECT 1 FROM tiddlers WHERE title = ?)",
-        [plugin_title],
-        |row| row.get(0)
-    ).unwrap_or(false);
+    // 打开数据库连接
+    let cxn = Connection::open(&config.db_path).map_err(AppError::from)?;
 
-    if !exists {
-        tracing::info!("Installing embedded S3 Uploader plugin...");
-        let v: serde_json::Value = serde_json::from_str(PLUGIN_JSON)
-            .map_err(|e| AppError::Serialization(format!("Invalid plugin json: {}", e)))?;
+    // 只有在数据库不存在时才执行初始化
+    if !db_exists {
+        const S3_PLUGIN_JSON: &str = include_str!("../s3_uploader_plugin.json");
+        const CPL_PLUGIN_JSON: &str = include_str!("../CPL-Repo.json");
+        // 开启 WAL 模式
+        cxn.execute_batch(r#"
+                            PRAGMA journal_mode = WAL;
+                            PRAGMA synchronous = FULL;
+                            PRAGMA busy_timeout = 5000;
+                            PRAGMA cache_size = -5000;
+                            PRAGMA mmap_size = 67108864;
+                            PRAGMA page_size = 4096;
+                            PRAGMA temp_store = MEMORY;
+                            PRAGMA journal_size_limit = 33554432;
+                            PRAGMA wal_checkpoint(TRUNCATE);"#)
+            .map_err(AppError::from)?;
         
-        let plugin_obj = if let serde_json::Value::Array(arr) = &v {
-            arr.first().ok_or(AppError::Serialization("Empty json array".into()))?
-        } else {
-            &v
-        };
-
-        let tiddler = Tiddler::from_value(plugin_obj.clone())?;
-        let mut stmt = cxn.prepare(
-            "INSERT INTO tiddlers (title, revision, meta) VALUES (:title, :revision, :meta)"
-        ).map_err(AppError::from)?;
+        // 执行初始化 SQL 脚本
+        let init_script = include_str!("./init.sql");
         
-        stmt.execute(rusqlite::named_params! {
-            ":title": tiddler.title,
-            ":revision": tiddler.revision,
-            ":meta": tiddler.meta,
-        }).map_err(AppError::from)?;
+        cxn.execute_batch(init_script)
+            .map_err(|e| AppError::Database(format!("初始化数据库失败: {}", e)))?;
+        insert_default_data(S3_PLUGIN_JSON,&cxn)?;
+        insert_default_data(CPL_PLUGIN_JSON,&cxn)?;
+        
+        tracing::info!("The database initialization has been completed.")
+    } else {
+        tracing::info!("Use the existing database!")
     }
-
     let tiddlers = Tiddlers { cxn };
     Ok(Arc::new(Mutex::new(tiddlers)))
 }
