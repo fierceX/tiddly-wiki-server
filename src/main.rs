@@ -15,8 +15,9 @@ use aws_sdk_s3::{config::Credentials, config::Region, presigning::PresigningConf
 use axum::{
     Extension, Router, extract::{self, DefaultBodyLimit, Request}, http::{StatusCode, header}, middleware::{self, Next}, response::Response, routing::{delete, get, post, put}
 };
+use axum::http::{HeaderValue, header::CONTENT_SECURITY_POLICY};
 use chrono::Local;
-
+use tower_http::set_header::SetResponseHeaderLayer; // 引入修改响应头的层
 use clap::Parser;
 use rusqlite::params;
 use rusqlite::Connection;
@@ -321,6 +322,7 @@ async fn main() {
     });
 
     let files_service = ServeDir::new(&config.server.files_dir);
+    let epub_service = ServeDir::new("foliate");
     let addr = SocketAddr::from((config.server.bind, config.server.port));
 
     // 6. 构建路由
@@ -337,6 +339,8 @@ async fn main() {
         .route("/api/sign-upload", get(get_presigned_url))
         .route("/api/inbox", post(add_inbox_item))
         .nest_service("/files", files_service)
+        .nest_service("/foliate", epub_service)
+        
         .layer(Extension(datastore))
         .layer(Extension(config.server)) 
         .layer(Extension(template))
