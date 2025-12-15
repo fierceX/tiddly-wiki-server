@@ -23,6 +23,12 @@
 -   **优化的 Wiki 渲染**：通过高效的内存拆分技术，将条目动态注入到 `empty.html` 模板中，大幅提升加载速度。
 -   **极低资源占用**：运行时仅需约 10MB 内存，而标准的 NodeJS 版服务端通常需要 70MB+。
 
+### 📖 集成 EPUB 阅读器
+-   **直接阅读**：服务端二进制文件直接内嵌了自定义的 [Foliate-js](https://github.com/johnfactotum/foliate-js) 阅读器。
+-   **无缝体验**：自动检测 `application/epub+zip` 类型的条目（通过 `_canonical_uri` 引用），并在现代化的阅读界面中渲染，替换默认的“二进制文件”下载提示。
+-   **S3 & 本地支持**：支持直接从 S3 或本地存储流式传输 EPUB 文件，无需先完整下载。
+-   **关于 CSP 的说明**：此内嵌阅读器**不会**执行客户端的内容安全策略 (CSP) 清洗。如果你导入的是由 Readeck 等工具生成且注入了严格 CSP meta 标签的 EPUB 文件，请确保在上传前对文件进行清洗/去毒。
+
 ### ☁️ 智能存储 (S3 & 本地)
 -   **本地文件分离**：二进制文件（图片、PDF 等）不再以 Base64 字符串形式存入数据库，而是自动保存到 `files/` 目录。Tiddler 仅保留 `_canonical_uri` 引用，确保数据库轻量且 Wiki 运行流畅。
 -   **S3/R2 直传支持**：
@@ -112,20 +118,40 @@ public_url_base = "https://assets.your-domain.com"
     ./target/release/tiddly-wiki-server --config config.toml
     ```
 
-## 开发指南：修改内置插件
+## 开发指南：插件与静态资源
 
-本项目内嵌了一个自定义的 TiddlyWiki 插件 (`s3-uploader`) 来处理拖拽上传逻辑。如果你需要修改上传器的 JavaScript 逻辑或 HTML 界面：
+本服务端内嵌了自定义的 TiddlyWiki 插件和静态资源（如阅读器）。你可以按照以下方式进行修改：
 
-1.  进入 `s3_uploader/` 目录。
-2.  直接编辑 `s3-uploader.js` (逻辑) 或 `ui-modal.html` (界面)。
-3.  **重新打包插件** (使用项目自带的工具):
-
+### 1. S3 上传插件 (S3 Uploader)
+处理拖拽上传至 S3/本地存储的逻辑。
+*   **源码位置**: `s3_uploader/`
+*   **打包命令**:
     ```sh
-    # 从源码文件重新生成 s3_uploader_plugin.json
     cargo run --bin pack_plugin -- ./s3_uploader/manifest.json ./s3_uploader_plugin.json
     ```
 
-4.  重新编译服务端 (`cargo build`) 以内嵌最新的插件代码。
+### 2. EPUB 阅读器插件 (EPUB Viewer Plugin)
+处理 TiddlyWiki UI 与 EPUB 文件的集成逻辑。
+*   **源码位置**: `epub_plugin/`
+*   **打包命令**:
+    ```sh
+    cargo run --bin pack_plugin -- ./epub_plugin/manifest.json ./epub_viewer_plugin.json
+    ```
+
+### 3. Foliate 阅读器 (内嵌静态资源)
+实际的阅读引擎是 Foliate-js 的定制构建版，直接嵌入在服务端二进制文件中。
+*   **源码位置**: `web/foliate-js/` (包含修改后的源代码)
+*   **构建产物**: `web/foliate-js/ebook_reader/` (Rust 嵌入的优化后的静态文件)
+*   **如何更新**: 
+    如果你修改了阅读器的源代码，必须在重新编译 Rust 服务端之前重建前端资源：
+    ```sh
+    cd web/foliate
+    npm install
+    npx vite build
+    # 确保输出位于 ./ebook_reader 且包含 reader.html
+    ```
+
+修改任何插件或资源后，请运行 `cargo build` 以将新版本嵌入到服务端可执行文件中。
 
 ## 许可证
 

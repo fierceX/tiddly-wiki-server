@@ -1,0 +1,36 @@
+{
+  "title": "$:/plugins/custom/epub-viewer",
+  "name": "EPUB Viewer",
+  "description": "Embeds Foliate reader for external EPUB files via _canonical_uri",
+  "author": "fiercex",
+  "version": "0.1.0",
+  "plugin-type": "plugin",
+  "tiddlers": [
+    {
+      "title": "$:/plugins/custom/epub-viewer/template",
+      "file": "tiddlers/template.tid",
+      "fields": {
+        "tags": []
+      }
+    },
+    {
+      "title": "$:/plugins/custom/epub-viewer/config/reader-url",
+      "file": "tiddlers/config_url.tid",
+      "fields": {}
+    },
+    {
+      "title": "$:/config/ViewTemplateBodyFilters/epub",
+      "file": "tiddlers/filter.tid",
+        "tags": ["$:/tags/ViewTemplateBodyFilter"],
+        "list-before": "$:/config/ViewTemplateBodyFilters/default",
+        "description": "Show EPUB viewer for application/epub+zip tiddlers"
+    },
+    {
+      "title": "$:/config/mimetypes/application/epub+zip",
+      "file": "tiddlers/mimetype.tid",
+        "description": "EPUB Ebook",
+        "priority": "high",
+        "group": "Text"
+    }
+  ]
+}

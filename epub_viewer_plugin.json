@@ -1,0 +1,12 @@
+[
+  {
+    "author": "fiercex",
+    "description": "Embeds Foliate reader for external EPUB files via _canonical_uri",
+    "name": "EPUB Viewer",
+    "plugin-type": "plugin",
+    "text": "{\"tiddlers\":{\"$:/config/ViewTemplateBodyFilters/epub\":{\"description\":\"Show EPUB viewer for application/epub+zip tiddlers\",\"list-before\":\"$:/config/ViewTemplateBodyFilters/default\",\"tags\":[\"$:/tags/ViewTemplateBodyFilter\"],\"text\":\"[field:type[application/epub+zip]then[$:/plugins/custom/epub-viewer/template]]\"},\"$:/config/mimetypes/application/epub+zip\":{\"description\":\"EPUB Ebook\",\"group\":\"Text\",\"priority\":\"high\",\"text\":\"application/epub+zip\"},\"$:/plugins/custom/epub-viewer/config/reader-url\":{\"fields\":{},\"text\":\"/foliate/reader.html?url=\"},\"$:/plugins/custom/epub-viewer/template\":{\"fields\":{\"tags\":[]},\"text\":\"<div style=\\\"width:100%; height:85vh; border:1px solid #ccc; border-radius: 8px; overflow: hidden;\\\">\\n  <iframe \\n    src={{{ [{$:/plugins/custom/epub-viewer/config/reader-url}addsuffix{!!_canonical_uri}] }}}\\n    style=\\\"width:100%; height:100%; border:none;\\\" \\n    allowfullscreen\\n    allow=\\\"clipboard-write\\\"\\n  >\\n  </iframe>\\n</div>\"}}}",
+    "title": "$:/plugins/custom/epub-viewer",
+    "type": "application/json",
+    "version": "0.1.0"
+  }
+]

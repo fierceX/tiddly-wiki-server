@@ -15,6 +15,13 @@ use aws_sdk_s3::{config::Credentials, config::Region, presigning::PresigningConf
 use axum::{
     Extension, Router, extract::{self, DefaultBodyLimit, Request}, http::{StatusCode, header}, middleware::{self, Next}, response::Response, routing::{delete, get, post, put}
 };
+
+use axum::{
+    body::Body,
+    extract::Path,
+    response::{IntoResponse},
+};
+
 use axum::http::{HeaderValue, header::CONTENT_SECURITY_POLICY};
 use chrono::Local;
 use tower_http::set_header::SetResponseHeaderLayer; // 引入修改响应头的层
@@ -36,6 +43,13 @@ use tower_http::{services::ServeDir, trace::TraceLayer};
 use tracing_subscriber::{EnvFilter, layer::{self, SubscriberExt}, util::SubscriberInitExt};
 use base64::{engine::general_purpose, Engine as _};
 use tower_http::compression::CompressionLayer;
+
+use rust_embed::RustEmbed;
+
+#[derive(RustEmbed)]
+#[folder = "web/foliate-js/ebook_reader/"] // 编译时，Cargo 会去这个路径把文件打包进来
+struct FoliateAssets;
+
 
 type DataStore = Arc<Mutex<Tiddlers>>;
 
@@ -248,6 +262,33 @@ async fn get_presigned_url(
     }))
 }
 
+
+// 处理 /foliate/* 的请求
+async fn static_handler(Path(path): Path<String>) -> impl IntoResponse {
+    // 1. 从嵌入资源中尝试获取文件
+    match FoliateAssets::get(path.as_str()) {
+        Some(content) => {
+            // 2. 猜测 MIME 类型 (例如 index.html -> text/html)
+            let mime = mime_guess::from_path(&path).first_or_octet_stream();
+            
+            // 3. 构建响应
+            Response::builder()
+                .header(header::CONTENT_TYPE, mime.as_ref())
+                // 可以根据需要添加缓存头，因为是内嵌文件，甚至可以缓存很久
+                .header(header::CACHE_CONTROL, "public, max-age=3600") 
+                .body(Body::from(content.data))
+                .unwrap()
+        }
+        None => {
+            // 4. 找不到文件返回 404
+            Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Body::from("404 Not Found"))
+                .unwrap()
+        }
+    }
+}
+
 // --- Main ---
 
 #[tokio::main]
@@ -322,7 +363,6 @@ async fn main() {
     });
 
     let files_service = ServeDir::new(&config.server.files_dir);
-    let epub_service = ServeDir::new("foliate");
     let addr = SocketAddr::from((config.server.bind, config.server.port));
 
     // 6. 构建路由
@@ -339,7 +379,8 @@ async fn main() {
         .route("/api/sign-upload", get(get_presigned_url))
         .route("/api/inbox", post(add_inbox_item))
         .nest_service("/files", files_service)
-        .nest_service("/foliate", epub_service)
+        // .nest_service("/foliate", epub_service)
+        .route("/foliate/{*path}", get(static_handler)) 
         
         .layer(Extension(datastore))
         .layer(Extension(config.server)) 
