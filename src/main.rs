@@ -187,12 +187,28 @@ struct PresignResponse {
     region: String,
 }
 
-// --- 新增：Inbox 请求结构 ---
-#[derive(Deserialize)]
+
+use std::collections::HashMap;
+
+#[derive(Deserialize, Debug)] // 建议加上 Debug 以便调试
 struct InboxRequest {
+    #[serde(rename = "type")] // 将 JSON 中的 "type" 映射为 item_type
+    item_type: String,
+    
+    title: String,
+    
+    tags: Vec<String>, // 现在接收字符串数组
+    
+    #[serde(rename = "content")] // 将 JSON 中的 "content" 映射为 text
     text: String,
-    #[serde(default)] // 如果客户端没传 tags 字段，默认为 None
-    tags: Option<String>,
+    
+    timestamp: String, // ISO 8601 格式字符串
+    
+    #[serde(default)]
+    context: Option<String>,
+    
+    #[serde(default)]
+    metadata: Option<HashMap<String, serde_json::Value>>,
 }
 
 // --- 预处理模板 ---
@@ -938,7 +954,6 @@ async fn auth_middleware(
     Ok(response)
 }
 
-// --- 新增：处理 Inbox 采集 ---
 async fn add_inbox_item(
     Extension(ds): Extension<DataStore>,
     extract::Json(payload): extract::Json<InboxRequest>,
@@ -946,44 +961,81 @@ async fn add_inbox_item(
     let mut lock = ds.lock().await;
     let tiddlers = &mut *lock;
 
-    // 1. 获取当前时间
-    let now = Local::now();
-    
-    // 2. 生成 TiddlyWiki 标准时间戳 (YYYYMMDDhhmmssXXX，精确到毫秒)
-    // TiddlyWiki 核心通常需要 17 位数字
-    let timestamp_str = now.format("%Y%m%d%H%M%S000").to_string();
+    // --- A. 时间处理 ---
+    // 尝试解析 ISO 8601 时间戳，如果失败则使用服务器当前时间
+    // TiddlyWiki 需要 17 位时间格式: YYYYMMDDhhmmssXXX
+    let created_dt = chrono::DateTime::parse_from_rfc3339(&payload.timestamp)
+        .map(|dt| dt.with_timezone(&chrono::Local))
+        .unwrap_or_else(|_| chrono::Local::now());
+    let tw_timestamp = created_dt.format("%Y%m%d%H%M%S%3f").to_string();
 
-    // 3. 生成标题：Inbox + 可读时间 (防止标题冲突)
-    let title = format!("Inbox {}", now.format("%Y-%m-%d %H:%M:%S"));
-
-    // 4. 处理标签：强制加上 "Inbox" 标签，方便后续筛选
-    let final_tags = match payload.tags {
-        Some(t) if !t.is_empty() => format!("Inbox {}", t), // 如果用户传了标签，追加在后面
-        _ => "Inbox".to_string(),
+    // --- B. 正文与 Context 处理 ---
+    // 将 context 格式化为 Markdown 引用块并拼接到正文头部
+    let final_text = match payload.context {
+        Some(ctx) if !ctx.is_empty() => {
+            format!("> **Context**: {}\n\n---\n\n{}", ctx, payload.text)
+        }
+        _ => payload.text,
     };
 
-    // 5. 构建 Tiddler 数据
-    // 注意：type 默认为 text/vnd.tiddlywiki (也就是默认的 wikitext 格式)
-    let tiddler_json = serde_json::json!({
-        "title": title,
-        "text": payload.text,
-        "tags": final_tags,
-        "created": timestamp_str,
-        "modified": timestamp_str,
-        "type": "text/vnd.tiddlywiki"
-    });
+    // --- C. 标签处理 ---
+    // 1. 强制包含 "Inbox"
+    // 2. 如果标签包含空格，使用 [[ ]] 包裹
+    let mut tags_list = payload.tags.clone();
+    if !tags_list.iter().any(|t| t == "Inbox") {
+        tags_list.push("Inbox".to_string());
+    }
+    
+    let tags_string = tags_list.iter()
+        .map(|s| {
+            if s.contains(' ') {
+                format!("[[{}]]", s)
+            } else {
+                s.to_string()
+            }
+        })
+        .collect::<Vec<String>>()
+        .join(" ");
 
-    // 6. 存入数据库
-    // 我们复用已有的 Tiddler::from_value 方法进行转换和校验
+    // --- D. 构建 Tiddler 数据 ---
+    let mut tiddler_map = serde_json::Map::new();
+
+    // 基础字段
+    tiddler_map.insert("title".to_string(), serde_json::Value::String(payload.title.clone()));
+    tiddler_map.insert("text".to_string(), serde_json::Value::String(final_text));
+    tiddler_map.insert("tags".to_string(), serde_json::Value::String(tags_string));
+    tiddler_map.insert("created".to_string(), serde_json::Value::String(tw_timestamp.clone()));
+    tiddler_map.insert("modified".to_string(), serde_json::Value::String(tw_timestamp.clone()));
+
+    // 类型字段：
+    // 1. type: 指定渲染器为 Markdown，适应 LLM 输出
+    // 2. item_type: 存储业务类型 (observation, conclusion 等)
+    tiddler_map.insert("type".to_string(), serde_json::Value::String("text/markdown".to_string()));
+    tiddler_map.insert("item_type".to_string(), serde_json::Value::String(payload.item_type));
+
+    // Metadata 展开字段
+    // 将 metadata 里的 kv 展平放入 tiddler 字段中 (例如 child_age, priority 等)
+    if let Some(meta) = payload.metadata {
+        for (k, v) in meta {
+            // 保护核心字段不被 metadata 覆盖
+            if !["title", "text", "tags", "created", "modified", "type"].contains(&k.as_str()) {
+                tiddler_map.insert(k, v);
+            }
+        }
+    }
+
+    let tiddler_json = serde_json::Value::Object(tiddler_map);
+
+    // --- E. 存入数据库 ---
+    // 复用 Tiddler::from_value 进行转换
     let tiddler = Tiddler::from_value(tiddler_json)?;
     tiddlers.put(tiddler)?;
 
-    tracing::info!("📥 Inbox captured: {}", title);
+    tracing::info!("📥 Inbox captured: '{}' [{}]", payload.title, tw_timestamp);
 
-    // 7. 返回成功响应
     Ok(axum::Json(serde_json::json!({
         "status": "ok",
-        "title": title,
-        "created": timestamp_str
+        "title": payload.title,
+        "created": tw_timestamp
     })))
 }
