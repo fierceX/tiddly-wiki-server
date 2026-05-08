@@ -153,6 +153,127 @@ public_url_base = "https://assets.your-domain.com"
 
 修改任何插件或资源后，请运行 `cargo build` 以将新版本嵌入到服务端可执行文件中。
 
+## Agent 友好 API 与 Python 库
+
+本服务端提供一组专为 AI Agent 和自动化工具设计的 HTTP API，以及配套的 Python 封装库和命令行工具。
+
+### Python 库 `wiki_client`
+
+位于 `tools/wiki_client/`，通过 pip 安装依赖后即可使用：
+
+```bash
+pip install requests
+```
+
+#### 快速入门
+
+```python
+from wiki_client import WikiClient
+
+wiki = WikiClient(
+    base_url="http://localhost:3032",
+    username="admin",
+    password="change_me_please",
+)
+
+# 搜索条目（支持中文分词）
+results = wiki.search("天气", mode="fts")
+# → [{"title": "...", "text": "..."}]
+
+# 正则模式搜索（Agent 友好）
+results = wiki.search(r"observ\w+tion", mode="regex")
+
+# 获取单个条目
+tiddler = wiki.get("我的标题")
+
+# 创建/更新条目
+wiki.put("新条目", content="# 正文\nMarkdown 格式", tags="标签1,标签2")
+
+# 快速采集到 Inbox
+wiki.inbox("速记标题", content="手机发送的内容", tags=["idea", "mobile"])
+
+# 列出条目（可按标签过滤）
+wiki.list(tag="Inbox", limit=10)
+
+# 删除条目
+wiki.delete("要删除的标题")
+```
+
+所有方法均抛出 `WikiClientError` 异常（含 HTTP 状态码），不直接 `exit`。
+
+#### `search()` 参数详解
+
+```python
+def search(
+    query: str,
+    tag: str = None,        # 按标签过滤
+    item_type: str = None,  # 按 item_type 过滤 (note/observation/...)
+    full: bool = False,     # 返回全部字段（默认仅元数据）
+    limit: int = 20,        # 每页条数
+    offset: int = 0,        # 偏移
+    mode: str = None,       # 搜索模式: "fts"(默认) | "regex"
+)
+```
+
+### 搜索模式
+
+#### `mode=fts`（默认）— FTS5 + jieba 中文分词
+
+- 使用 SQLite FTS5 全文索引，搭配 **jieba-rs** 中文分词
+- 自动处理中文分词（"天气" → 匹配"天气晴朗"）
+- 支持前缀通配符（"plug" → 匹配"plugin"）
+- 性能 O(log N)，适合日常搜索
+
+#### `mode=regex` — 正则表达式
+
+- 全量加载后使用 Rust `regex` crate 匹配
+- 支持完整正则语法：`\d+`, `^.*(Report|Note).*$`, `\bword\b`
+- 可与 `tag` / `item_type` 参数组合过滤
+- 适合 Agent 需要精确模式匹配的场景
+
+### 命令行工具 `wiki_cli.py`
+
+```bash
+# 通过环境变量设置认证
+export WIKI_SERVER_URL=http://localhost:3032
+export WIKI_USERNAME=admin
+export WIKI_PASSWORD=change_me_please
+
+# 搜索
+python3 tools/wiki_cli.py search "天气" --full --limit 5
+python3 tools/wiki_cli.py search ".*观察.*" --mode regex --tag Inbox
+
+# 获取
+python3 tools/wiki_cli.py get "我的标题" --text-only
+
+# 创建/更新
+python3 tools/wiki_cli.py put "新条目" --content "正文" --tags "标签1,标签2"
+
+# 快速采集
+python3 tools/wiki_cli.py inbox "速记" --content "内容" --tags "idea,mobile"
+
+# 列出
+python3 tools/wiki_cli.py list --tag Inbox --limit 10
+python3 tools/wiki_cli.py list --inbox --plain
+
+# 删除
+python3 tools/wiki_cli.py delete "条目标题" --force
+```
+
+### REST API 端点一览
+
+| 端点 | 方法 | 说明 |
+|---|---|---|
+| `/api/search?q=关键词&mode=fts&tag=Inbox&limit=20` | GET | 搜索条目（fts/regex 模式） |
+| `/api/tiddlers?title=标题` | GET | 按标题获取条目（无需 URL 编码） |
+| `/recipes/default/tiddlers.json` | GET | 列出所有条目 |
+| `/api/tiddlers/tag/{tag}` | GET | 按标签列出条目 |
+| `/recipes/default/tiddlers/{title}` | PUT | 创建/更新条目 |
+| `/api/inbox` | POST | 快速采集到 Inbox |
+| `/api/inbox` | GET | 列出 Inbox 条目 |
+| `/bags/default/tiddlers/{title}` | DELETE | 删除条目 |
+| `/status` | GET | 服务器状态 |
+
 ## 许可证
 
 本项目基于 [The Prosperity Public License 3.0.0] 许可证发布。

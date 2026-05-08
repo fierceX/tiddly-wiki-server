@@ -150,6 +150,78 @@ The actual reader engine is a customized build of Foliate-js, embedded directly 
 
 After modifying any plugin or asset, run `cargo build` to embed the new versions into the server executable.
 
+## Agent-Friendly API & Python Library
+
+The server provides REST APIs designed for AI Agents and automation, plus a Python wrapper library and CLI.
+
+### Python Library `wiki_client`
+
+Located at `tools/wiki_client/`. Requires `requests`:
+
+```bash
+pip install requests
+```
+
+```python
+from wiki_client import WikiClient
+
+wiki = WikiClient(
+    base_url="http://localhost:3032",
+    username="admin",
+    password="change_me_please",
+)
+
+# Search with Chinese word segmentation
+results = wiki.search("天气", mode="fts")
+
+# Regex search (Agent-friendly)
+results = wiki.search(r"observ\w+tion", mode="regex")
+
+# Get / Put / Inbox / List / Delete
+tiddler = wiki.get("My Title")
+wiki.put("New Tiddler", content="Body", tags="tag1,tag2")
+wiki.inbox("Quick Note", content="From mobile", tags=["idea"])
+wiki.list(tag="Inbox", limit=10)
+wiki.delete("Tiddler")
+```
+
+### Search Modes
+
+| Mode | Description | Performance |
+|---|---|---|
+| `fts` (default) | FTS5 + jieba Chinese tokenization, prefix matching | O(log N) |
+| `regex` | Full regex via Rust `regex` crate | O(N) |
+
+### CLI Tool `wiki_cli.py`
+
+```bash
+export WIKI_SERVER_URL=http://localhost:3032
+export WIKI_USERNAME=admin
+export WIKI_PASSWORD=change_me_please
+
+python3 tools/wiki_cli.py search "weather" --full --limit 5
+python3 tools/wiki_cli.py search ".*observation.*" --mode regex
+python3 tools/wiki_cli.py get "My Title" --text-only
+python3 tools/wiki_cli.py put "New Tiddler" --content "body" --tags "tag1,tag2"
+python3 tools/wiki_cli.py inbox "Quick Note" --content "body" --tags "idea,mobile"
+python3 tools/wiki_cli.py list --tag Inbox --limit 10
+python3 tools/wiki_cli.py delete "Tiddler" --force
+```
+
+### REST API Endpoints
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/api/search?q=keyword&mode=fts&tag=Inbox&limit=20` | GET | Search (fts / regex) |
+| `/api/tiddlers?title=title` | GET | Get tiddler (no URL-encoding) |
+| `/recipes/default/tiddlers.json` | GET | List all |
+| `/api/tiddlers/tag/{tag}` | GET | List by tag |
+| `/recipes/default/tiddlers/{title}` | PUT | Create / update |
+| `/api/inbox` | POST | Inbox capture |
+| `/api/inbox` | GET | List inbox |
+| `/bags/default/tiddlers/{title}` | DELETE | Delete |
+| `/status` | GET | Server status |
+
 ## License
 
 This project is made available under [The Prosperity Public License 3.0.0].
