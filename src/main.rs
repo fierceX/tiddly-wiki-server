@@ -562,14 +562,29 @@ fn initialize_datastore(config: &ServerConfig) -> AppResult<DataStore> {
         }
     }
 
-    // [[链接]] 索引回填：只在 tiddler_links 表为空时执行（新表创建后首次启动）
+    // [[链接]] 索引回填
     {
         let count: i64 = cxn.query_row(
             "SELECT COUNT(*) FROM tiddler_links",
             [],
             |r| r.get(0),
         ).unwrap_or(0);
-        if count == 0 {
+        let has_dirty: bool = cxn.query_row(
+            "SELECT COUNT(*) > 0 FROM tiddler_links WHERE target LIKE '%|%'",
+            [],
+            |r| r.get(0),
+        ).unwrap_or(false);
+
+        let needs_backfill = count == 0 || has_dirty;
+
+        if has_dirty {
+            tracing::warn!("Found dirty link data (targets containing '|'), clearing and re-backfilling...");
+            if let Err(e) = cxn.execute("DELETE FROM tiddler_links", []) {
+                tracing::warn!("failed to clear tiddler_links: {}", e);
+            }
+        }
+
+        if needs_backfill {
             tracing::info!("tiddler_links table is empty, backfilling link index...");
             let mut stmt = cxn.prepare("SELECT title, meta FROM tiddlers").unwrap_or_else(|e| {
                 tracing::warn!("cannot prepare link backfill query: {}", e);
@@ -581,7 +596,7 @@ fn initialize_datastore(config: &ServerConfig) -> AppResult<DataStore> {
                 let meta_val: String = r.get(1)?;
                 Ok((title, meta_val))
             }) {
-                let link_re = regex::Regex::new(r"\[\[([^\]]+)\]\]").unwrap();
+                let link_re = regex::Regex::new(r"\[\[([^\]]+?)(?:\|([^\]]+))?\]\]").unwrap();
                 let mut inserted = 0usize;
                 let mut failed = 0usize;
                 for row in rows.flatten() {
@@ -590,7 +605,8 @@ fn initialize_datastore(config: &ServerConfig) -> AppResult<DataStore> {
                     if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&meta_str) {
                         let text = meta.get("text").and_then(|v| v.as_str()).unwrap_or("");
                         for cap in link_re.captures_iter(text) {
-                            let target = cap.get(1).unwrap().as_str();
+                            let target = cap.get(2).or_else(|| cap.get(1)).map(|m| m.as_str()).unwrap_or("");
+                            if target.is_empty() { continue; }
                             if let Err(e) = cxn.execute(
                                 "INSERT OR IGNORE INTO tiddler_links(source, target) VALUES (?1, ?2)",
                                 rusqlite::params![title, target],
@@ -1042,13 +1058,18 @@ impl Tiddlers {
             return;
         }
         // 2. 解析 [[链接]] 并批量插入（编译一次 regex 供重复调用）
+        //    TiddlyWiki 语法：[[目标标题]] 或 [[显示名|目标标题]]
         static LINK_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
         let link_re = LINK_RE.get_or_init(|| {
-            regex::Regex::new(r"\[\[([^\]]+)\]\]").expect("invalid link regex")
+            // 匹配 [[目标]] 或 [[显示名|目标]]，提取最后一个 pipe 后的部分为目标
+            regex::Regex::new(r"\[\[([^\]]+?)(?:\|([^\]]+))?\]\]").expect("invalid link regex")
         });
         let mut inserted = 0;
         for cap in link_re.captures_iter(text) {
-            let target = cap.get(1).unwrap().as_str();
+            // cap[1] = [[ 和 | 之间的部分（或没有 | 时的全部内容）
+            // cap[2] = | 和 ]] 之间的部分（如果有 |）
+            let target = cap.get(2).or_else(|| cap.get(1)).map(|m| m.as_str()).unwrap_or("");
+            if target.is_empty() { continue; }
             if let Err(e) = self.cxn.execute(
                 "INSERT OR IGNORE INTO tiddler_links(source, target) VALUES (?1, ?2)",
                 rusqlite::params![source, target],
