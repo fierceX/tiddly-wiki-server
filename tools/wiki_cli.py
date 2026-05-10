@@ -187,6 +187,21 @@ def cmd_backlinks(args):
         sys.exit(1)
 
 
+def cmd_tags(args):
+    """列出所有标签及出现次数。"""
+    try:
+        client = WikiClient()
+        results = client.tags()
+        if args.plain:
+            for entry in results:
+                print(f"{entry['tag']:30s}  {entry['count']:4d}")
+        else:
+            print(json.dumps(results, ensure_ascii=False, indent=2))
+    except WikiClientError as e:
+        sys.stderr.write(f"wiki: {e}\n")
+        sys.exit(1)
+
+
 # ── 主入口 ──────────────────────────────────────────────────────────────
 
 def main():
@@ -258,6 +273,11 @@ def main():
     p.add_argument("title", help="条目标题")
     p.add_argument("--plain", action="store_true", help="纯文本列表")
     p.set_defaults(func=cmd_backlinks)
+
+    # tags
+    p = sub.add_parser("tags", help="列出所有标签及出现次数")
+    p.add_argument("--plain", action="store_true", help="纯文本列表")
+    p.set_defaults(func=cmd_tags)
 
     args = parser.parse_args()
     args.func(args)

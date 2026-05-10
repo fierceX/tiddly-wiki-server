@@ -123,6 +123,27 @@ backlinks = wiki.backlinks("矛盾的概念")  # → ["科学的研究事物和�
 
 **说明：** 链接关系在写入条目时自动解析 `[[标题]]` 语法并建索引，无需手动管理。返回结果基于 `tiddler_links` 表的 O(log N) 索引查询。初始数据在服务端首次启动时自动全量回填。
 
+### 列出所有标签
+
+```python
+# 获取所有标签及其出现次数（按次数降序）
+all_tags = wiki.tags()
+# → [{"tag": "认知", "count": 41}, {"tag": "矛盾", "count": 9}, ...]
+```
+
+### 无限制获取（limit=0）
+
+`search()`、`list()` 等方法支持 `limit=0` 表示不限制返回数量：
+
+```python
+# 获取全部条目（不分页）
+wiki.list(tag="Inbox", limit=0)
+wiki.search("天气", limit=0)
+
+# 获取全部链接
+wiki.links("标题")   # 默认 50，底层支持 limit=0
+```
+
 ## CLI 用法
 
 ```bash
@@ -138,8 +159,9 @@ python3 tools/wiki_cli.py put "新条目" --content "正文" --tags "标签1,标
 # 快速采集
 python3 tools/wiki_cli.py inbox "速记" --content "内容" --tags "idea,mobile"
 
-# 列出
+# 列出（--limit 0 表示全部）
 python3 tools/wiki_cli.py list --tag Inbox --limit 10 --plain
+python3 tools/wiki_cli.py list --tag Inbox --limit 0 --plain
 
 # 删除
 python3 tools/wiki_cli.py delete "标题" --force
@@ -149,6 +171,10 @@ python3 tools/wiki_cli.py links "条目标题"
 python3 tools/wiki_cli.py links "条目标题" --plain
 python3 tools/wiki_cli.py backlinks "条目标题"
 python3 tools/wiki_cli.py backlinks "条目标题" --plain
+
+# 列出所有标签
+python3 tools/wiki_cli.py tags
+python3 tools/wiki_cli.py tags --plain
 ```
 
 ## 错误处理
@@ -169,10 +195,11 @@ except WikiClientError as e:
 
 | 端点 | 方法 | 用途 |
 |---|---|---|
-| `/api/search?q=...&mode=fts&tag=...&limit=20` | GET | 搜索 |
+| `/api/search?q=...&mode=fts&tag=...&limit=20` | GET | 搜索（limit=0 表示全部） |
 | `/api/tiddlers?title=xxx` | GET | 获取条目 |
+| `/api/tags` | GET | 所有标签及计数 |
 | `/recipes/default/tiddlers.json` | GET | 列表 |
-| `/api/tiddlers/tag/{tag}` | GET | 按标签列表 |
+| `/api/tiddlers/tag/{tag}` | GET | 按标签列表（limit=0 表示全部） |
 | `/api/tiddlers/{title}/links` | GET | 正向链接列表 |
 | `/api/tiddlers/{title}/backlinks` | GET | 反向链接列表 |
 | `/recipes/default/tiddlers/{title}` | PUT | 创建/更新 |

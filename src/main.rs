@@ -423,6 +423,7 @@ async fn main() {
         .route("/bags/efault/tiddlers/{title}", delete(delete_tiddler)) // 兼容旧客户端拼写错误
         .route("/api", get(api_index))
         .route("/api/sign-upload", get(get_presigned_url))
+        .route("/api/tags", get(all_tags))
         .route("/api/search", get(search_tiddlers))
         .route("/api/memory/context", get(memory_context))
         .route("/api/tiddlers", get(get_tiddler_by_query))
@@ -1105,10 +1106,12 @@ impl Tiddlers {
 
     /// 正向链接：某条目链接了哪些目标
     pub(crate) fn links(&self, title: &str, limit: usize, offset: usize) -> AppResult<Vec<String>> {
+        // SQLite: LIMIT -1 表示无限制
+        let sql_limit = if limit > 0 { limit as i64 } else { -1 };
         const Q: &str = "SELECT target FROM tiddler_links WHERE source = ?1 ORDER BY target LIMIT ?2 OFFSET ?3";
         let mut stmt = self.cxn.prepare_cached(Q)?;
         let results = stmt.query_map(
-            rusqlite::params![title, limit, offset],
+            rusqlite::params![title, sql_limit, offset],
             |r| r.get::<usize, String>(0),
         )?;
         let mut out = Vec::new();
@@ -1120,10 +1123,11 @@ impl Tiddlers {
 
     /// 反向链接：哪些条目链接到某目标
     pub(crate) fn backlinks(&self, title: &str, limit: usize, offset: usize) -> AppResult<Vec<String>> {
+        let sql_limit = if limit > 0 { limit as i64 } else { -1 };
         const Q: &str = "SELECT source FROM tiddler_links WHERE target = ?1 ORDER BY source LIMIT ?2 OFFSET ?3";
         let mut stmt = self.cxn.prepare_cached(Q)?;
         let results = stmt.query_map(
-            rusqlite::params![title, limit, offset],
+            rusqlite::params![title, sql_limit, offset],
             |r| r.get::<usize, String>(0),
         )?;
         let mut out = Vec::new();
@@ -1131,6 +1135,23 @@ impl Tiddlers {
             out.push(r.map_err(AppError::from)?);
         }
         Ok(out)
+    }
+
+    /// 获取所有标签及其出现次数（按次数降序排列）
+    pub(crate) fn tags(&self) -> AppResult<Vec<(String, usize)>> {
+        use std::collections::BTreeMap;
+        let all = self.all()?;
+        let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+        for t in &all {
+            if let Some(tags_str) = t.meta.get("tags").and_then(|v| v.as_str()) {
+                for tag in tags_str.split(' ').filter(|s| !s.is_empty()) {
+                    *counts.entry(tag.to_string()).or_default() += 1;
+                }
+            }
+        }
+        let mut sorted: Vec<(String, usize)> = counts.into_iter().collect();
+        sorted.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        Ok(sorted)
     }
 }
 
@@ -1369,7 +1390,7 @@ async fn search_tiddlers(
             // fts 模式（默认）：FTS5（jieba 分词），FTS 失败时 fallback 全量
             if params.q.is_some() {
                 let q = params.q.as_ref().unwrap();
-                match tiddlers.search_fts(q, limit * 5 + offset, 0) {
+                match tiddlers.search_fts(q, if limit > 0 { limit * 5 + offset } else { usize::MAX }, 0) {
                     Ok(fts_results) => fts_results,
                     Err(e) => {
                         tracing::warn!("FTS search failed, falling back to full scan: {:?}", e);
@@ -1402,10 +1423,11 @@ async fn search_tiddlers(
         mb.cmp(&ma)
     });
 
-    // 4. 分页
+    // 4. 分页（limit=0 表示不限制）
+    let take_limit = if limit > 0 { limit } else { usize::MAX };
     let paged: Vec<serde_json::Value> = results.into_iter()
         .skip(offset)
-        .take(limit)
+        .take(take_limit)
         .map(|t| if params.include_text.unwrap_or(false) {
             t.as_value()
         } else {
@@ -1492,9 +1514,9 @@ async fn memory_context(
         b.get_field("modified").cmp(&a.get_field("modified"))
     });
 
-    // 精简输出：截断 text 到 ~500 字符
+    // 精简输出：截断 text 到 ~500 字符；limit=0 不限制
     let output: Vec<serde_json::Value> = results.into_iter()
-        .take(limit)
+        .take(if limit > 0 { limit } else { usize::MAX })
         .map(|t| {
             let mut v = t.as_value();
             if let Some(obj) = v.as_object_mut() {
@@ -1539,6 +1561,19 @@ async fn tiddler_backlinks(
     Ok(axum::Json(links))
 }
 
+/// GET /api/tags — 所有标签及其出现次数
+async fn all_tags(
+    Extension(ds): Extension<DataStore>,
+) -> AppResult<axum::Json<Vec<serde_json::Value>>> {
+    let mut lock = ds.lock().await;
+    let tiddlers = &mut *lock;
+    let tags = tiddlers.tags()?;
+    let result: Vec<serde_json::Value> = tags.into_iter()
+        .map(|(tag, count)| serde_json::json!({"tag": tag, "count": count}))
+        .collect();
+    Ok(axum::Json(result))
+}
+
 /// GET /api — API 自描述端点
 async fn api_index() -> axum::Json<serde_json::Value> {
     axum::Json(serde_json::json!({
@@ -1546,6 +1581,10 @@ async fn api_index() -> axum::Json<serde_json::Value> {
         "description": "TiddlyWiki Server — Agent-friendly API",
         "endpoints": {
             "GET /api": "This self-describing endpoint",
+            "GET /api/tags": {
+                "description": "List all tags with tiddler counts",
+                "params": {}
+            },
             "GET /api/search": {
                 "description": "Search tiddlers by keyword, tag, and item_type",
                 "params": {
@@ -1608,7 +1647,7 @@ async fn tiddlers_by_tag(
     let results: Vec<serde_json::Value> = all.iter()
         .filter(|t| t.has_tag(&tag))
         .skip(offset)
-        .take(limit)
+        .take(if limit > 0 { limit } else { usize::MAX })
         .map(|t| if params.include_text.unwrap_or(false) {
             t.as_value()
         } else {

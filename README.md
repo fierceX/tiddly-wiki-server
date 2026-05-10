@@ -187,6 +187,13 @@ wiki.delete("Tiddler")
 # Links and backlinks
 links = wiki.links("Some Title")          # → ["linked 1", "linked 2"]
 backlinks = wiki.backlinks("Some Title")  # → ["referrer 1", ...]
+
+# All tags
+tags = wiki.tags()  # → [{"tag": "cognition", "count": 41}, ...]
+
+# Unlimited results with limit=0
+wiki.search("weather", limit=0)           # all results
+wiki.list(tag="Inbox", limit=0)           # all inbox items
 ```
 
 ### Search Modes
@@ -209,19 +216,23 @@ python3 tools/wiki_cli.py get "My Title" --text-only
 python3 tools/wiki_cli.py put "New Tiddler" --content "body" --tags "tag1,tag2"
 python3 tools/wiki_cli.py inbox "Quick Note" --content "body" --tags "idea,mobile"
 python3 tools/wiki_cli.py list --tag Inbox --limit 10
+python3 tools/wiki_cli.py list --tag Inbox --limit 0 --plain
 python3 tools/wiki_cli.py delete "Tiddler" --force
 python3 tools/wiki_cli.py links "Some Title"
 python3 tools/wiki_cli.py backlinks "Some Title"
+python3 tools/wiki_cli.py tags
+python3 tools/wiki_cli.py tags --plain
 ```
 
 ### REST API Endpoints
 
 | Endpoint | Method | Description |
 |---|---|---|
-| `/api/search?q=keyword&mode=fts&tag=Inbox&limit=20` | GET | Search (fts / regex) |
+| `/api/search?q=keyword&mode=fts&tag=Inbox&limit=20` | GET | Search (fts / regex, limit=0 = all) |
 | `/api/tiddlers?title=title` | GET | Get tiddler (no URL-encoding) |
+| `/api/tags` | GET | All tags with counts |
 | `/recipes/default/tiddlers.json` | GET | List all |
-| `/api/tiddlers/tag/{tag}` | GET | List by tag |
+| `/api/tiddlers/tag/{tag}` | GET | List by tag (limit=0 = all) |
 | `/api/tiddlers/{title}/links` | GET | Forward links |
 | `/api/tiddlers/{title}/backlinks` | GET | Backlinks |
 | `/recipes/default/tiddlers/{title}` | PUT | Create / update |

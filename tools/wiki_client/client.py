@@ -213,6 +213,13 @@ class WikiClient:
         """列出所有 Inbox 条目。"""
         return self._get("/api/inbox")
 
+    def tags(self) -> list:
+        """获取所有标签及其出现次数。
+
+        返回: [{"tag": "认知", "count": 41}, {"tag": "矛盾", "count": 9}, ...]
+        """
+        return self._get("/api/tags")
+
     def links(self, title: str) -> list:
         """正向链接：列出某个条目链接了哪些目标条目标题。"""
         return self._get(f"/api/tiddlers/{quote(title, safe='')}/links")
