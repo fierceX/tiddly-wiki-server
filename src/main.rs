@@ -427,6 +427,8 @@ async fn main() {
         .route("/api/memory/context", get(memory_context))
         .route("/api/tiddlers", get(get_tiddler_by_query))
         .route("/api/tiddlers/tag/{tag}", get(tiddlers_by_tag))
+        .route("/api/tiddlers/{title}/links", get(tiddler_links))
+        .route("/api/tiddlers/{title}/backlinks", get(tiddler_backlinks))
         .route("/api/inbox", get(list_inbox).post(add_inbox_item))
         .nest_service("/files", files_service)
         // .nest_service("/foliate", epub_service)
@@ -558,6 +560,55 @@ fn initialize_datastore(config: &ServerConfig) -> AppResult<DataStore> {
             }
         }
     }
+
+    // [[链接]] 索引回填：只在 tiddler_links 表为空时执行（新表创建后首次启动）
+    {
+        let count: i64 = cxn.query_row(
+            "SELECT COUNT(*) FROM tiddler_links",
+            [],
+            |r| r.get(0),
+        ).unwrap_or(0);
+        if count == 0 {
+            tracing::info!("tiddler_links table is empty, backfilling link index...");
+            let mut stmt = cxn.prepare("SELECT title, meta FROM tiddlers").unwrap_or_else(|e| {
+                tracing::warn!("cannot prepare link backfill query: {}", e);
+                // 返回一个空语句占位，实际上跳过
+                return cxn.prepare("SELECT '', '{}' FROM tiddlers WHERE 1=0").unwrap();
+            });
+            if let Ok(rows) = stmt.query_map([], |r| {
+                let title: String = r.get(0)?;
+                let meta_val: String = r.get(1)?;
+                Ok((title, meta_val))
+            }) {
+                let link_re = regex::Regex::new(r"\[\[([^\]]+)\]\]").unwrap();
+                let mut inserted = 0usize;
+                let mut failed = 0usize;
+                for row in rows.flatten() {
+                    let (title, meta_str) = row;
+                    // 从 meta JSON 中提取 text 字段
+                    if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&meta_str) {
+                        let text = meta.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                        for cap in link_re.captures_iter(text) {
+                            let target = cap.get(1).unwrap().as_str();
+                            if let Err(e) = cxn.execute(
+                                "INSERT OR IGNORE INTO tiddler_links(source, target) VALUES (?1, ?2)",
+                                rusqlite::params![title, target],
+                            ) {
+                                tracing::warn!("link backfill failed: {} -> {}: {}", title, target, e);
+                                failed += 1;
+                            } else {
+                                inserted += 1;
+                            }
+                        }
+                    }
+                }
+                tracing::info!("Link index backfill complete: {} links indexed, {} failed", inserted, failed);
+            }
+        } else {
+            tracing::debug!("tiddler_links has {} rows, skipping backfill", count);
+        }
+    }
+
     let tiddlers = Tiddlers { cxn, jieba };
     Ok(Arc::new(Mutex::new(tiddlers)))
 }
@@ -753,10 +804,15 @@ async fn try_delete_associated_file(tiddler: Tiddler, state: Arc<AppState>, conf
 async fn put_tiddler(
     Extension(ds): Extension<DataStore>,
     Extension(config): Extension<ServerConfig>, // 注意这里改成了 ServerConfig
+    Extension(auth): Extension<Option<AuthConfig>>,
     extract::Path(title): extract::Path<String>,
     extract::Json(mut v): extract::Json<serde_json::Value>,
 ) -> AppResult<axum::http::Response<String>> {
     use axum::http::response::Response;
+
+    let default_username = auth.as_ref()
+        .map(|a| a.username.clone())
+        .unwrap_or_else(|| "anonymous".to_string());
 
     let is_binary = if let Some(type_val) = v.get("type") {
         let t = type_val.as_str().unwrap_or("");
@@ -805,9 +861,53 @@ async fn put_tiddler(
     let mut lock = ds.lock().await;
     let tiddlers = &mut *lock;
 
-    if let Some(_old_tiddler) = tiddlers.pop(&title)? {
+    let now = Local::now().format("%Y%m%d%H%M%S%3f").to_string();
+
+    if let Some(old_tiddler) = tiddlers.pop(&title)? {
+        // ── 更新已有条目 ──
         new_tiddler.revision += 1;
+        if let Some(obj) = new_tiddler.meta.as_object_mut() {
+            // 保留原有的 created/creator（客户端没发时）
+            if !obj.contains_key("created") {
+                if let Some(old_v) = old_tiddler.meta.get("created") {
+                    obj.insert("created".to_string(), old_v.clone());
+                } else {
+                    obj.insert("created".to_string(), Value::String(now.clone()));
+                }
+            }
+            if !obj.contains_key("creator") {
+                if let Some(old_v) = old_tiddler.meta.get("creator") {
+                    obj.insert("creator".to_string(), old_v.clone());
+                }
+            }
+            // 更新 modified/modifier
+            if !obj.contains_key("modified") {
+                obj.insert("modified".to_string(), Value::String(now.clone()));
+            }
+            if !obj.contains_key("modifier") {
+                if let Some(old_v) = old_tiddler.meta.get("modifier") {
+                    obj.insert("modifier".to_string(), old_v.clone());
+                }
+            }
+        }
+    } else {
+        // ── 新建条目 ──
+        if let Some(obj) = new_tiddler.meta.as_object_mut() {
+            if !obj.contains_key("created") {
+                obj.insert("created".to_string(), Value::String(now.clone()));
+            }
+            if !obj.contains_key("modified") {
+                obj.insert("modified".to_string(), Value::String(now.clone()));
+            }
+            if !obj.contains_key("creator") {
+                obj.insert("creator".to_string(), Value::String(default_username.clone()));
+            }
+            if !obj.contains_key("modifier") {
+                obj.insert("modifier".to_string(), Value::String(default_username.clone()));
+            }
+        }
     }
+
     let new_revision = new_tiddler.revision;
     tiddlers.put(new_tiddler)?;
     
@@ -871,6 +971,8 @@ impl Tiddlers {
         })?;
         // Best-effort FTS 同步
         self.sync_fts_insert(&tiddler.title, &text, tags);
+        // 链接索引同步
+        self.sync_links(&tiddler.title, &text);
         Ok(())
     }
 
@@ -892,6 +994,8 @@ impl Tiddlers {
         if let Some(rid) = rowid {
             self.sync_fts_delete_by_rowid(rid, title);
         }
+        // 链接索引清理
+        self.sync_links_delete(title);
         Ok(result)
     }
 
@@ -926,6 +1030,48 @@ impl Tiddlers {
         }
     }
 
+    /// 链接索引同步：解析 `[[链接]]` 并写入 tiddler_links 表（best-effort）
+    fn sync_links(&self, source: &str, text: &str) {
+        // 1. 清除该来源的旧链接记录
+        if let Err(e) = self.cxn.execute(
+            "DELETE FROM tiddler_links WHERE source = ?1",
+            rusqlite::params![source],
+        ) {
+            tracing::warn!("link sync delete failed for '{}': {}", source, e);
+            return;
+        }
+        // 2. 解析 [[链接]] 并批量插入（编译一次 regex 供重复调用）
+        static LINK_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        let link_re = LINK_RE.get_or_init(|| {
+            regex::Regex::new(r"\[\[([^\]]+)\]\]").expect("invalid link regex")
+        });
+        let mut inserted = 0;
+        for cap in link_re.captures_iter(text) {
+            let target = cap.get(1).unwrap().as_str();
+            if let Err(e) = self.cxn.execute(
+                "INSERT OR IGNORE INTO tiddler_links(source, target) VALUES (?1, ?2)",
+                rusqlite::params![source, target],
+            ) {
+                tracing::warn!("link sync insert failed for '{}' -> '{}': {}", source, target, e);
+            } else {
+                inserted += 1;
+            }
+        }
+        if inserted > 0 {
+            tracing::debug!("synced {} links from '{}'", inserted, source);
+        }
+    }
+
+    /// 链接索引清理：删除某个来源的所有链接记录
+    fn sync_links_delete(&self, source: &str) {
+        if let Err(e) = self.cxn.execute(
+            "DELETE FROM tiddler_links WHERE source = ?1",
+            rusqlite::params![source],
+        ) {
+            tracing::warn!("link sync delete failed for '{}': {}", source, e);
+        }
+    }
+
     /// FTS5 全文搜索——用 jieba 分词生成 FTS5 AND 查询
     pub(crate) fn search_fts(&self, query: &str, limit: usize, offset: usize) -> AppResult<Vec<Tiddler>> {
         let fts_query = self.build_fts_query(query);
@@ -955,6 +1101,36 @@ impl Tiddlers {
             .map(|t| format!("{}*", t))
             .collect::<Vec<_>>()
             .join(" ")
+    }
+
+    /// 正向链接：某条目链接了哪些目标
+    pub(crate) fn links(&self, title: &str, limit: usize, offset: usize) -> AppResult<Vec<String>> {
+        const Q: &str = "SELECT target FROM tiddler_links WHERE source = ?1 ORDER BY target LIMIT ?2 OFFSET ?3";
+        let mut stmt = self.cxn.prepare_cached(Q)?;
+        let results = stmt.query_map(
+            rusqlite::params![title, limit, offset],
+            |r| r.get::<usize, String>(0),
+        )?;
+        let mut out = Vec::new();
+        for r in results {
+            out.push(r.map_err(AppError::from)?);
+        }
+        Ok(out)
+    }
+
+    /// 反向链接：哪些条目链接到某目标
+    pub(crate) fn backlinks(&self, title: &str, limit: usize, offset: usize) -> AppResult<Vec<String>> {
+        const Q: &str = "SELECT source FROM tiddler_links WHERE target = ?1 ORDER BY source LIMIT ?2 OFFSET ?3";
+        let mut stmt = self.cxn.prepare_cached(Q)?;
+        let results = stmt.query_map(
+            rusqlite::params![title, limit, offset],
+            |r| r.get::<usize, String>(0),
+        )?;
+        let mut out = Vec::new();
+        for r in results {
+            out.push(r.map_err(AppError::from)?);
+        }
+        Ok(out)
     }
 }
 
@@ -1333,6 +1509,34 @@ async fn memory_context(
         .collect();
 
     Ok(axum::Json(output))
+}
+
+/// GET /api/tiddlers/{title}/links — 正向链接列表
+async fn tiddler_links(
+    Extension(ds): Extension<DataStore>,
+    extract::Path(title): extract::Path<String>,
+    extract::Query(params): extract::Query<SearchParams>,
+) -> AppResult<axum::Json<Vec<String>>> {
+    let mut lock = ds.lock().await;
+    let tiddlers = &mut *lock;
+    let limit = params.limit.unwrap_or(50);
+    let offset = params.offset.unwrap_or(0);
+    let links = tiddlers.links(&title, limit, offset)?;
+    Ok(axum::Json(links))
+}
+
+/// GET /api/tiddlers/{title}/backlinks — 反向链接列表
+async fn tiddler_backlinks(
+    Extension(ds): Extension<DataStore>,
+    extract::Path(title): extract::Path<String>,
+    extract::Query(params): extract::Query<SearchParams>,
+) -> AppResult<axum::Json<Vec<String>>> {
+    let mut lock = ds.lock().await;
+    let tiddlers = &mut *lock;
+    let limit = params.limit.unwrap_or(50);
+    let offset = params.offset.unwrap_or(0);
+    let links = tiddlers.backlinks(&title, limit, offset)?;
+    Ok(axum::Json(links))
 }
 
 /// GET /api — API 自描述端点

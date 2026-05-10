@@ -140,8 +140,18 @@ class WikiClient:
             current_revision = existing.get("revision", "0")
             if isinstance(current_revision, str):
                 current_revision = int(current_revision)
+            is_new = False
+            existing_created = existing.get("created", "")
+            existing_creator = existing.get("creator", "")
         except WikiClientError:
             current_revision = 0
+            is_new = True
+            existing_created = ""
+            existing_creator = ""
+
+        now = datetime.now()
+        ts = now.strftime("%Y%m%d%H%M%S") + f"{now.microsecond // 1000:03d}"
+        username = self.auth[0] if self.auth else ""
 
         payload = {
             "title": title,
@@ -149,7 +159,19 @@ class WikiClient:
             "type": "text/markdown",
             "tags": tags or "",
             "revision": str(current_revision),
+            "modified": ts,
+            "modifier": username,
         }
+        # 新建时补充创建元数据；更新时保留原有的
+        if is_new:
+            payload["created"] = ts
+            payload["creator"] = username
+        else:
+            if existing_created:
+                payload["created"] = existing_created
+            if existing_creator:
+                payload["creator"] = existing_creator
+
         status = self._put(f"/recipes/default/tiddlers/{quote(title)}", payload)
         return status == 204
 
@@ -190,6 +212,14 @@ class WikiClient:
     def list_inbox(self) -> list:
         """列出所有 Inbox 条目。"""
         return self._get("/api/inbox")
+
+    def links(self, title: str) -> list:
+        """正向链接：列出某个条目链接了哪些目标条目标题。"""
+        return self._get(f"/api/tiddlers/{quote(title, safe='')}/links")
+
+    def backlinks(self, title: str) -> list:
+        """反向链接：列出哪些条目链接到了某个目标。"""
+        return self._get(f"/api/tiddlers/{quote(title, safe='')}/backlinks")
 
     def delete(self, title: str) -> bool:
         """删除条目。返回 True 表示成功。"""

@@ -157,6 +157,36 @@ def cmd_delete(args):
         sys.exit(1)
 
 
+def cmd_links(args):
+    """正向链接：列出某条目链接的目标。"""
+    try:
+        client = WikiClient()
+        results = client.links(args.title)
+        if args.plain:
+            for t in results:
+                print(t)
+        else:
+            print(json.dumps(results, ensure_ascii=False, indent=2))
+    except WikiClientError as e:
+        sys.stderr.write(f"wiki: {e}\n")
+        sys.exit(1)
+
+
+def cmd_backlinks(args):
+    """反向链接：列出链接到某条目的来源。"""
+    try:
+        client = WikiClient()
+        results = client.backlinks(args.title)
+        if args.plain:
+            for t in results:
+                print(t)
+        else:
+            print(json.dumps(results, ensure_ascii=False, indent=2))
+    except WikiClientError as e:
+        sys.stderr.write(f"wiki: {e}\n")
+        sys.exit(1)
+
+
 # ── 主入口 ──────────────────────────────────────────────────────────────
 
 def main():
@@ -216,6 +246,18 @@ def main():
     p.add_argument("title", help="条目标题")
     p.add_argument("--force", action="store_true", help="跳过确认")
     p.set_defaults(func=cmd_delete)
+
+    # links
+    p = sub.add_parser("links", help="列出正向链接（某条目链接的目标）")
+    p.add_argument("title", help="条目标题")
+    p.add_argument("--plain", action="store_true", help="纯文本列表")
+    p.set_defaults(func=cmd_links)
+
+    # backlinks
+    p = sub.add_parser("backlinks", help="列出反向链接（链接到某条目的来源）")
+    p.add_argument("title", help="条目标题")
+    p.add_argument("--plain", action="store_true", help="纯文本列表")
+    p.set_defaults(func=cmd_backlinks)
 
     args = parser.parse_args()
     args.func(args)

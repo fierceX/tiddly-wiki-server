@@ -183,6 +183,10 @@ wiki.put("New Tiddler", content="Body", tags="tag1,tag2")
 wiki.inbox("Quick Note", content="From mobile", tags=["idea"])
 wiki.list(tag="Inbox", limit=10)
 wiki.delete("Tiddler")
+
+# Links and backlinks
+links = wiki.links("Some Title")          # → ["linked 1", "linked 2"]
+backlinks = wiki.backlinks("Some Title")  # → ["referrer 1", ...]
 ```
 
 ### Search Modes
@@ -206,6 +210,8 @@ python3 tools/wiki_cli.py put "New Tiddler" --content "body" --tags "tag1,tag2"
 python3 tools/wiki_cli.py inbox "Quick Note" --content "body" --tags "idea,mobile"
 python3 tools/wiki_cli.py list --tag Inbox --limit 10
 python3 tools/wiki_cli.py delete "Tiddler" --force
+python3 tools/wiki_cli.py links "Some Title"
+python3 tools/wiki_cli.py backlinks "Some Title"
 ```
 
 ### REST API Endpoints
@@ -216,6 +222,8 @@ python3 tools/wiki_cli.py delete "Tiddler" --force
 | `/api/tiddlers?title=title` | GET | Get tiddler (no URL-encoding) |
 | `/recipes/default/tiddlers.json` | GET | List all |
 | `/api/tiddlers/tag/{tag}` | GET | List by tag |
+| `/api/tiddlers/{title}/links` | GET | Forward links |
+| `/api/tiddlers/{title}/backlinks` | GET | Backlinks |
 | `/recipes/default/tiddlers/{title}` | PUT | Create / update |
 | `/api/inbox` | POST | Inbox capture |
 | `/api/inbox` | GET | List inbox |

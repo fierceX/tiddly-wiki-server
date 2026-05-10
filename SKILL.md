@@ -11,8 +11,8 @@
 tools/
   wiki_client/
     __init__.py        # 库入口
-    client.py          # WikiClient 类 (search/get/put/inbox/list/delete)
-  wiki_cli.py          # 命令行工具 (wiki search/get/put/inbox/list/delete)
+    client.py          # WikiClient 类 (search/get/put/inbox/list/delete/links/backlinks)
+  wiki_cli.py          # 命令行工具 (wiki search/get/put/inbox/list/delete/links/backlinks)
 ```
 
 ## 依赖
@@ -111,6 +111,18 @@ inbox = wiki.list_inbox()
 wiki.delete("要删除的标题")   # 返回 True/False
 ```
 
+### 正向/反向链接
+
+```python
+# 列出某条目链接的所有目标
+links = wiki.links("矛盾的概念")      # → ["矛盾的普遍性", ...]
+
+# 列出链接到某条目的所有来源
+backlinks = wiki.backlinks("矛盾的概念")  # → ["科学的研究事物和问题的方法", ...]
+```
+
+**说明：** 链接关系在写入条目时自动解析 `[[标题]]` 语法并建索引，无需手动管理。返回结果基于 `tiddler_links` 表的 O(log N) 索引查询。初始数据在服务端首次启动时自动全量回填。
+
 ## CLI 用法
 
 ```bash
@@ -131,6 +143,12 @@ python3 tools/wiki_cli.py list --tag Inbox --limit 10 --plain
 
 # 删除
 python3 tools/wiki_cli.py delete "标题" --force
+
+# 正向/反向链接
+python3 tools/wiki_cli.py links "条目标题"
+python3 tools/wiki_cli.py links "条目标题" --plain
+python3 tools/wiki_cli.py backlinks "条目标题"
+python3 tools/wiki_cli.py backlinks "条目标题" --plain
 ```
 
 ## 错误处理
@@ -155,6 +173,8 @@ except WikiClientError as e:
 | `/api/tiddlers?title=xxx` | GET | 获取条目 |
 | `/recipes/default/tiddlers.json` | GET | 列表 |
 | `/api/tiddlers/tag/{tag}` | GET | 按标签列表 |
+| `/api/tiddlers/{title}/links` | GET | 正向链接列表 |
+| `/api/tiddlers/{title}/backlinks` | GET | 反向链接列表 |
 | `/recipes/default/tiddlers/{title}` | PUT | 创建/更新 |
 | `/api/inbox` | POST | Inbox 采集 |
 | `/bags/default/tiddlers/{title}` | DELETE | 删除 |
