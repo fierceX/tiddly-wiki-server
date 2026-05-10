@@ -48,6 +48,14 @@ wiki = WikiClient(
 wiki.search("天气", mode="fts", limit=5)
 wiki.search("天气", tag="Inbox", full=True)
 
+# 时间范围过滤（YYYYMMDDHHMMSSmmm）
+wiki.search("", created_after="20251201000000000", limit=0)     # 2025-12 后创建
+wiki.search("", modified_after="20260501000000000", limit=0)    # 5月后修改
+wiki.search("", created_before="20240101000000000", limit=0)    # 2024前创建
+
+# 组合过滤
+wiki.search("", tag="认知", modified_after="20260101000000000", full=True, limit=0)
+
 # 正则模式（精确模式匹配）
 wiki.search(r"observ\w+tion", mode="regex")
 wiki.search(r"\d{4}-\d{2}-\d{2}", mode="regex")
@@ -175,6 +183,20 @@ python3 tools/wiki_cli.py backlinks "条目标题" --plain
 # 列出所有标签
 python3 tools/wiki_cli.py tags
 python3 tools/wiki_cli.py tags --plain
+
+# 增量感知（最近修改）
+python3 tools/wiki_cli.py changes                    # 默认 24h
+python3 tools/wiki_cli.py changes --since 7d          # 最近 7 天
+python3 tools/wiki_cli.py changes --since 20260501    # 指定日期后
+python3 tools/wiki_cli.py changes --tag 认知 --plain   # 按标签过滤
+
+# 批量链接查询
+python3 tools/wiki_cli.py batch-links "标题1" "标题2"
+python3 tools/wiki_cli.py batch-links "标题1" "标题2" --plain
+
+# 链接图谱遍历
+python3 tools/wiki_cli.py graph "矛盾的概念"            # BFS 深度 2
+python3 tools/wiki_cli.py graph "矛盾的概念" --depth 3 --plain
 ```
 
 ## 错误处理
@@ -195,11 +217,11 @@ except WikiClientError as e:
 
 | 端点 | 方法 | 用途 |
 |---|---|---|
-| `/api/search?q=...&mode=fts&tag=...&limit=20` | GET | 搜索（limit=0 表示全部） |
+| `/api/search?q=...&mode=fts&tag=...&limit=20` | GET | 搜索（支持 modified_after/before, created_after/before） |
 | `/api/tiddlers?title=xxx` | GET | 获取条目 |
 | `/api/tags` | GET | 所有标签及计数 |
 | `/recipes/default/tiddlers.json` | GET | 列表 |
-| `/api/tiddlers/tag/{tag}` | GET | 按标签列表（limit=0 表示全部） |
+| `/api/tiddlers/tag/{tag}` | GET | 按标签列表（支持时间范围参数） |
 | `/api/tiddlers/{title}/links` | GET | 正向链接列表 |
 | `/api/tiddlers/{title}/backlinks` | GET | 反向链接列表 |
 | `/recipes/default/tiddlers/{title}` | PUT | 创建/更新 |

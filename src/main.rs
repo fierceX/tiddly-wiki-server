@@ -226,6 +226,11 @@ struct SearchParams {
     include_text: Option<bool>,     // 是否返回全文（默认 false）
     limit: Option<usize>,           // 每页条数（默认 20）
     offset: Option<usize>,          // 偏移（默认 0）
+    // 时间范围过滤（TiddlyWiki 时间格式: YYYYMMDDHHMMSSmmm）
+    modified_after: Option<String>,   // 修改时间 ≥
+    modified_before: Option<String>,  // 修改时间 ≤
+    created_after: Option<String>,    // 创建时间 ≥
+    created_before: Option<String>,   // 创建时间 ≤
 }
 
 #[derive(Deserialize)]
@@ -1265,6 +1270,27 @@ impl Tiddler {
             .map(|s| s.to_string())
     }
 
+    /// 检查条目的时间字段是否在指定范围内
+    /// TiddlyWiki 时间格式 YYYYMMDDHHMMSSmmm 可直接字符串比较
+    pub(crate) fn matches_time(
+        &self,
+        field: &str,            // "created" 或 "modified"
+        after: Option<&str>,    // 时间 ≥ 此值
+        before: Option<&str>,   // 时间 ≤ 此值
+    ) -> bool {
+        let val = match self.get_field(field) {
+            Some(v) => v,
+            None => return after.is_none() && before.is_none(),
+        };
+        if let Some(a) = after {
+            if val.as_str() < a { return false; }
+        }
+        if let Some(b) = before {
+            if val.as_str() > b { return false; }
+        }
+        true
+    }
+
     /// Agent 友好的规范化输出格式
     /// - tags: 统一为数组
     /// - revision: 数字类型
@@ -1424,7 +1450,7 @@ async fn search_tiddlers(
         }
     };
 
-    // 2. 内存过滤（tag / item_type）
+    // 2. 内存过滤（tag / item_type / 时间范围）
     let mut results: Vec<&Tiddler> = candidates.iter().filter(|t| {
         if let Some(ref tag) = params.tag {
             if !t.has_tag(tag) { return false; }
@@ -1433,6 +1459,12 @@ async fn search_tiddlers(
             if t.get_field("item_type").as_deref() != Some(it.as_str()) {
                 return false;
             }
+        }
+        if !t.matches_time("modified", params.modified_after.as_deref(), params.modified_before.as_deref()) {
+            return false;
+        }
+        if !t.matches_time("created", params.created_after.as_deref(), params.created_before.as_deref()) {
+            return false;
         }
         true
     }).collect();
@@ -1613,8 +1645,12 @@ async fn api_index() -> axum::Json<serde_json::Value> {
                     "tag": "Filter by tag",
                     "item_type": "Filter by item_type field (note/observation/backup/...)",
                     "include_text": "Include full text in results (default: false)",
-                    "limit": "Page size (default: 20)",
-                    "offset": "Page offset (default: 0)"
+                    "limit": "Page size (default: 20, 0=unlimited)",
+                    "offset": "Page offset (default: 0)",
+                    "modified_after": "Modified >= YYYYMMDDHHMMSSmmm",
+                    "modified_before": "Modified <= YYYYMMDDHHMMSSmmm",
+                    "created_after": "Created >= YYYYMMDDHHMMSSmmm",
+                    "created_before": "Created <= YYYYMMDDHHMMSSmmm"
                 }
             },
             "GET /api/tiddlers": {
@@ -1666,7 +1702,9 @@ async fn tiddlers_by_tag(
     let limit = params.limit.unwrap_or(50);
 
     let results: Vec<serde_json::Value> = all.iter()
-        .filter(|t| t.has_tag(&tag))
+        .filter(|t| t.has_tag(&tag)
+            && t.matches_time("modified", params.modified_after.as_deref(), params.modified_before.as_deref())
+            && t.matches_time("created", params.created_after.as_deref(), params.created_before.as_deref()))
         .skip(offset)
         .take(if limit > 0 { limit } else { usize::MAX })
         .map(|t| if params.include_text.unwrap_or(false) {

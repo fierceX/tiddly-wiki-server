@@ -42,6 +42,10 @@ def cmd_search(args):
             limit=args.limit,
             offset=args.offset,
             mode=getattr(args, "mode", None),
+            modified_after=getattr(args, "modified_after", None),
+            modified_before=getattr(args, "modified_before", None),
+            created_after=getattr(args, "created_after", None),
+            created_before=getattr(args, "created_before", None),
         )
         if args.plain:
             for r in results:
@@ -202,6 +206,102 @@ def cmd_tags(args):
         sys.exit(1)
 
 
+def cmd_changes(args):
+    """列出最近修改的条目（增量感知）。"""
+    try:
+        client = WikiClient()
+        params = {"limit": args.limit}
+        if args.since:
+            # 支持自然语言: "24h", "7d", "20260501"
+            if args.since.endswith("h"):
+                import datetime
+                ts = (datetime.datetime.now() - datetime.timedelta(hours=int(args.since[:-1])))
+                params["modified_after"] = ts.strftime("%Y%m%d%H%M%S") + "000"
+            elif args.since.endswith("d"):
+                import datetime
+                ts = (datetime.datetime.now() - datetime.timedelta(days=int(args.since[:-1])))
+                params["modified_after"] = ts.strftime("%Y%m%d%H%M%S") + "000"
+            else:
+                params["modified_after"] = args.since
+        if args.tag:
+            params["tag"] = args.tag
+        results = client._get("/api/search", params)
+        if args.plain:
+            for r in results:
+                mod = r.get("modified", "")[:8]
+                title = r.get("title", "")
+                print(f"{mod}  {title}")
+        else:
+            print(json.dumps(results, ensure_ascii=False, indent=2))
+    except WikiClientError as e:
+        sys.stderr.write(f"wiki: {e}\n")
+        sys.exit(1)
+
+
+def cmd_batch_links(args):
+    """批量查询多个条目的正向链接。"""
+    try:
+        client = WikiClient()
+        titles = args.titles
+        result = {}
+        for t in titles:
+            try:
+                links = client.links(t)
+                result[t] = links
+            except Exception:
+                result[t] = []
+        if args.plain:
+            for source, targets in result.items():
+                if targets:
+                    print(f"{source}:")
+                    for tg in targets:
+                        print(f"  → {tg}")
+        else:
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+    except WikiClientError as e:
+        sys.stderr.write(f"wiki: {e}\n")
+        sys.exit(1)
+
+
+def cmd_graph(args):
+    """从指定条目出发做 BFS 遍历，输出链接图谱。"""
+    try:
+        client = WikiClient()
+        start = args.start
+        depth = args.depth
+        visited = set()
+        queue = [(start, 0)]
+        graph = {}  # {title: [linked_titles]}
+        all_user_items = None  # lazy load
+
+        while queue:
+            title, d = queue.pop(0)
+            if title in visited or d > depth:
+                continue
+            visited.add(title)
+            try:
+                targets = client.links(title)
+                graph[title] = targets
+                if d < depth:
+                    for t in targets:
+                        if t not in visited:
+                            queue.append((t, d + 1))
+            except Exception:
+                graph[title] = []
+
+        if args.plain:
+            for source, targets in graph.items():
+                if targets:
+                    print(f"{source}  →  {', '.join(targets)}")
+                else:
+                    print(f"{source}  →  (无链接)")
+        else:
+            print(json.dumps(graph, ensure_ascii=False, indent=2))
+    except WikiClientError as e:
+        sys.stderr.write(f"wiki: {e}\n")
+        sys.exit(1)
+
+
 # ── 主入口 ──────────────────────────────────────────────────────────────
 
 def main():
@@ -221,6 +321,10 @@ def main():
     p.add_argument("--offset", type=int, default=0, help="偏移")
     p.add_argument("--plain", action="store_true", help="纯文本标题列表")
     p.add_argument("--mode", choices=["fts", "regex"], default=None, help="搜索模式：fts(默认) | regex")
+    p.add_argument("--modified-after", help="修改时间 ≥ (YYYYMMDDHHMMSSmmm)")
+    p.add_argument("--modified-before", help="修改时间 ≤")
+    p.add_argument("--created-after", help="创建时间 ≥")
+    p.add_argument("--created-before", help="创建时间 ≤")
     p.set_defaults(func=cmd_search)
 
     # get
@@ -278,6 +382,27 @@ def main():
     p = sub.add_parser("tags", help="列出所有标签及出现次数")
     p.add_argument("--plain", action="store_true", help="纯文本列表")
     p.set_defaults(func=cmd_tags)
+
+    # changes
+    p = sub.add_parser("changes", help="列出最近修改的条目（增量感知）")
+    p.add_argument("--since", default="24h", help="时间范围: 24h / 7d / YYYYMMDDHHMMSSmmm (默认 24h)")
+    p.add_argument("--tag", help="按标签过滤")
+    p.add_argument("--limit", type=int, default=50, help="最大条数")
+    p.add_argument("--plain", action="store_true", help="纯文本列表")
+    p.set_defaults(func=cmd_changes)
+
+    # batch-links
+    p = sub.add_parser("batch-links", help="批量查询多个条目的正向链接")
+    p.add_argument("titles", nargs="+", help="条目标题（可多个）")
+    p.add_argument("--plain", action="store_true", help="纯文本输出")
+    p.set_defaults(func=cmd_batch_links)
+
+    # graph
+    p = sub.add_parser("graph", help="从指定条目出发 BFS 遍历链接图谱")
+    p.add_argument("start", help="起始条目标题")
+    p.add_argument("--depth", type=int, default=2, help="遍历深度（默认 2）")
+    p.add_argument("--plain", action="store_true", help="纯文本输出")
+    p.set_defaults(func=cmd_graph)
 
     args = parser.parse_args()
     args.func(args)

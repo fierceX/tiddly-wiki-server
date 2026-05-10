@@ -97,6 +97,10 @@ class WikiClient:
         limit: int = 20,
         offset: int = 0,
         mode: Optional[str] = None,
+        modified_after: Optional[str] = None,
+        modified_before: Optional[str] = None,
+        created_after: Optional[str] = None,
+        created_before: Optional[str] = None,
     ) -> list:
         """搜索条目。
 
@@ -105,9 +109,11 @@ class WikiClient:
             tag:       按标签过滤
             item_type: 按 item_type 字段过滤
             full:      是否返回全文（默认只返回元数据）
-            limit:     每页条数（默认 20）
+            limit:     每页条数（默认 20, 0=全部）
             offset:    偏移量
             mode:      搜索模式 — fts(默认) | regex
+            modified_after/before: 修改时间范围 (YYYYMMDDHHMMSSmmm)
+            created_after/before:  创建时间范围 (YYYYMMDDHHMMSSmmm)
         """
         params: dict = {"q": query, "limit": limit, "offset": offset}
         if tag:
@@ -118,6 +124,14 @@ class WikiClient:
             params["include_text"] = "true"
         if mode:
             params["mode"] = mode
+        if modified_after:
+            params["modified_after"] = modified_after
+        if modified_before:
+            params["modified_before"] = modified_before
+        if created_after:
+            params["created_after"] = created_after
+        if created_before:
+            params["created_before"] = created_before
         return self._get("/api/search", params)
 
     def get(self, title: str) -> dict:

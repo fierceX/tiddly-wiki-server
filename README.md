@@ -194,6 +194,10 @@ tags = wiki.tags()  # → [{"tag": "cognition", "count": 41}, ...]
 # Unlimited results with limit=0
 wiki.search("weather", limit=0)           # all results
 wiki.list(tag="Inbox", limit=0)           # all inbox items
+
+# Time-range filtering (YYYYMMDDHHMMSSmmm format)
+wiki.search("", created_after="20251201000000000", limit=0)
+wiki.search("", modified_after="20260501000000000", tag="cognition", full=True)
 ```
 
 ### Search Modes
@@ -222,17 +226,26 @@ python3 tools/wiki_cli.py links "Some Title"
 python3 tools/wiki_cli.py backlinks "Some Title"
 python3 tools/wiki_cli.py tags
 python3 tools/wiki_cli.py tags --plain
+
+# Incremental awareness (changes since last check)
+python3 tools/wiki_cli.py changes
+python3 tools/wiki_cli.py changes --since 7d
+python3 tools/wiki_cli.py changes --since 20260501 --tag cognition
+
+# Batch links & graph traversal
+python3 tools/wiki_cli.py batch-links "Title1" "Title2" --plain
+python3 tools/wiki_cli.py graph "Some Title" --depth 2 --plain
 ```
 
 ### REST API Endpoints
 
 | Endpoint | Method | Description |
 |---|---|---|
-| `/api/search?q=keyword&mode=fts&tag=Inbox&limit=20` | GET | Search (fts / regex, limit=0 = all) |
+| `/api/search?q=keyword&mode=fts&tag=Inbox&limit=20` | GET | Search (supports modified_after/before, created_after/before) |
 | `/api/tiddlers?title=title` | GET | Get tiddler (no URL-encoding) |
 | `/api/tags` | GET | All tags with counts |
 | `/recipes/default/tiddlers.json` | GET | List all |
-| `/api/tiddlers/tag/{tag}` | GET | List by tag (limit=0 = all) |
+| `/api/tiddlers/tag/{tag}` | GET | List by tag (supports time range params) |
 | `/api/tiddlers/{title}/links` | GET | Forward links |
 | `/api/tiddlers/{title}/backlinks` | GET | Backlinks |
 | `/recipes/default/tiddlers/{title}` | PUT | Create / update |
