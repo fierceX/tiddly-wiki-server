@@ -207,13 +207,36 @@ wiki.search("", modified_after="20260501000000000", tag="cognition", full=True)
 | `fts` (default) | FTS5 + jieba Chinese tokenization, prefix matching | O(log N) |
 | `regex` | Full regex via Rust `regex` crate | O(N) |
 
-### CLI Tool `wiki_cli.py`
+### CLI Tool `wiki_cli.py` / `wiki` (Rust)
+
+Two implementations available. **Rust version recommended** (zero dependencies, faster startup):
 
 ```bash
-export WIKI_SERVER_URL=http://localhost:3032
-export WIKI_USERNAME=admin
-export WIKI_PASSWORD=change_me_please
+# Build the Rust CLI (one time)
+cargo build --bin wiki
+# Now use it directly:
+./target/debug/wiki search "weather" --full --limit 5
 
+# Rust (recommended)
+wiki search "weather" --full --limit 5
+wiki search ".*observation.*" --mode regex
+wiki get "My Title" --text-only
+wiki put "New Tiddler" --content "body" --tags "tag1,tag2"
+wiki inbox "Quick Note" --content "body" --tags "idea,mobile"
+wiki list --tag Inbox --limit 10
+wiki list --tag Inbox --limit 0 --plain
+wiki delete "Tiddler" --force
+wiki links "Some Title"
+wiki backlinks "Some Title"
+wiki batch-links "Title1" "Title2" --plain
+wiki graph "Some Title" --depth 2 --plain
+wiki tags
+wiki tags --plain
+wiki changes
+wiki changes --since 7d
+wiki changes --since 20260501 --tag cognition --plain
+
+# Python (fallback)
 python3 tools/wiki_cli.py search "weather" --full --limit 5
 python3 tools/wiki_cli.py search ".*observation.*" --mode regex
 python3 tools/wiki_cli.py get "My Title" --text-only
@@ -224,17 +247,13 @@ python3 tools/wiki_cli.py list --tag Inbox --limit 0 --plain
 python3 tools/wiki_cli.py delete "Tiddler" --force
 python3 tools/wiki_cli.py links "Some Title"
 python3 tools/wiki_cli.py backlinks "Some Title"
-python3 tools/wiki_cli.py tags
-python3 tools/wiki_cli.py tags --plain
-
-# Incremental awareness (changes since last check)
-python3 tools/wiki_cli.py changes
-python3 tools/wiki_cli.py changes --since 7d
-python3 tools/wiki_cli.py changes --since 20260501 --tag cognition
-
-# Batch links & graph traversal
 python3 tools/wiki_cli.py batch-links "Title1" "Title2" --plain
 python3 tools/wiki_cli.py graph "Some Title" --depth 2 --plain
+python3 tools/wiki_cli.py tags
+python3 tools/wiki_cli.py tags --plain
+python3 tools/wiki_cli.py changes
+python3 tools/wiki_cli.py changes --since 7d
+python3 tools/wiki_cli.py changes --since 20260501 --tag cognition --plain
 ```
 
 ### REST API Endpoints

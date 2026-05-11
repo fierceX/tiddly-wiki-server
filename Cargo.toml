@@ -31,10 +31,15 @@ chrono = "0.4.42"
 jieba-rs = "0.9"
 rust-embed = "8.9.0"
 mime_guess = "2.0.5"
+reqwest = { version = "0.12", features = ["blocking", "json"] }
 
 [[bin]]
 name = "pack_plugin"
 path = "tools/plugin_packer.rs"
+
+[[bin]]
+name = "wiki"
+path = "tools/wiki_cli.rs"
 
 # The profile that 'cargo dist' will build with
 [profile.dist]

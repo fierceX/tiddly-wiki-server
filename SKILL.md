@@ -12,13 +12,22 @@ tools/
   wiki_client/
     __init__.py        # 库入口
     client.py          # WikiClient 类 (search/get/put/inbox/list/delete/links/backlinks)
-  wiki_cli.py          # 命令行工具 (wiki search/get/put/inbox/list/delete/links/backlinks)
+  wiki_cli.py          # 命令行工具 (Python, 依赖 requests)
+  wiki_cli.rs          # 命令行工具 (Rust, 独立二进制, 推荐)
 ```
 
 ## 依赖
 
+Python 库:
 ```bash
 pip install requests
+```
+
+Rust CLI（独立二进制，零依赖）:
+```bash
+cargo build --bin wiki
+# 或直接使用
+./target/debug/wiki --help
 ```
 
 ## 初始化
@@ -155,47 +164,40 @@ wiki.links("标题")   # 默认 50，底层支持 limit=0
 ## CLI 用法
 
 ```bash
-# 搜索
+# Rust 版（推荐，零依赖）
+wiki search "关键词" --full --limit 5 --mode regex
+wiki get "标题" --text-only
+wiki put "新条目" --content "正文" --tags "标签1,标签2"
+wiki inbox "速记" --content "内容" --tags "idea,mobile"
+wiki list --tag Inbox --limit 10 --plain
+wiki delete "标题" --force
+wiki links "条目标题"
+wiki backlinks "条目标题"
+wiki batch-links "标题1" "标题2"
+wiki graph "矛盾的概念" --depth 2 --plain
+wiki tags
+wiki changes
+wiki changes --since 7d --tag 认知 --plain
+
+# Python 版（作为 fallback）
 python3 tools/wiki_cli.py search "关键词" --full --limit 5 --mode regex
-
-# 获取
 python3 tools/wiki_cli.py get "标题" --text-only
-
-# 创建/更新
 python3 tools/wiki_cli.py put "新条目" --content "正文" --tags "标签1,标签2"
-
-# 快速采集
 python3 tools/wiki_cli.py inbox "速记" --content "内容" --tags "idea,mobile"
-
-# 列出（--limit 0 表示全部）
 python3 tools/wiki_cli.py list --tag Inbox --limit 10 --plain
-python3 tools/wiki_cli.py list --tag Inbox --limit 0 --plain
-
-# 删除
 python3 tools/wiki_cli.py delete "标题" --force
-
-# 正向/反向链接
 python3 tools/wiki_cli.py links "条目标题"
 python3 tools/wiki_cli.py links "条目标题" --plain
 python3 tools/wiki_cli.py backlinks "条目标题"
 python3 tools/wiki_cli.py backlinks "条目标题" --plain
-
-# 列出所有标签
 python3 tools/wiki_cli.py tags
 python3 tools/wiki_cli.py tags --plain
-
-# 增量感知（最近修改）
-python3 tools/wiki_cli.py changes                    # 默认 24h
-python3 tools/wiki_cli.py changes --since 7d          # 最近 7 天
-python3 tools/wiki_cli.py changes --since 20260501    # 指定日期后
-python3 tools/wiki_cli.py changes --tag 认知 --plain   # 按标签过滤
-
-# 批量链接查询
+python3 tools/wiki_cli.py changes
+python3 tools/wiki_cli.py changes --since 7d
+python3 tools/wiki_cli.py changes --since 20260501 --tag 认知 --plain
 python3 tools/wiki_cli.py batch-links "标题1" "标题2"
 python3 tools/wiki_cli.py batch-links "标题1" "标题2" --plain
-
-# 链接图谱遍历
-python3 tools/wiki_cli.py graph "矛盾的概念"            # BFS 深度 2
+python3 tools/wiki_cli.py graph "矛盾的概念"
 python3 tools/wiki_cli.py graph "矛盾的概念" --depth 3 --plain
 ```
 
