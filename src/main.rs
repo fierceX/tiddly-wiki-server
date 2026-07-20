@@ -397,7 +397,17 @@ async fn main() {
     
     tracing::info!("Configuration loaded from {:?}", args.config);
 
-    // 3. 初始化数据库
+    // 3a. 自动恢复：本地无数据库时从 S3 备份拉取
+    if !config.server.db_path.exists() {
+        if let Some(ref restore_cfg) = try_get_restore_config(&config.s3, &config.backup) {
+            tracing::info!("Local database not found, attempting restore from S3 backup...");
+            if let Err(e) = try_restore_from_s3(restore_cfg, &config.server.db_path).await {
+                tracing::warn!("Restore from S3 failed (server will create new database): {}", e);
+            }
+        }
+    }
+
+    // 3b. 初始化数据库
     let datastore = initialize_datastore(&config.server).expect("Error initializing datastore");
 
     // 4. 加载 HTML 模板
@@ -489,6 +499,84 @@ async fn main() {
         .await
         .expect("Error binding TCP listener");
     axum::serve(listener, app).await.expect("Error serving app");
+}
+
+// ─── 自动恢复 ───────────────────────────────────────────────
+
+struct RestoreConfig {
+    access_key: String,
+    secret_key: String,
+    endpoint: String,
+    region: String,
+    bucket: String,
+    prefix: String,
+}
+
+fn try_get_restore_config(s3: &S3Config, backup: &BackupConfig) -> Option<RestoreConfig> {
+    if !s3.enable || backup.s3_bucket.is_empty() {
+        return None;
+    }
+    Some(RestoreConfig {
+        access_key: s3.access_key.clone(),
+        secret_key: s3.secret_key.clone(),
+        endpoint: s3.endpoint.clone(),
+        region: s3.region.clone(),
+        bucket: backup.s3_bucket.clone(),
+        prefix: backup.s3_prefix.clone(),
+    })
+}
+
+async fn try_restore_from_s3(cfg: &RestoreConfig, db_path: &std::path::Path) -> Result<(), String> {
+    let credentials = Credentials::new(&cfg.access_key, &cfg.secret_key, None, None, "restore");
+    let region = Region::new(cfg.region.clone());
+    let s3_config = aws_config::defaults(BehaviorVersion::latest())
+        .region(region)
+        .credentials_provider(credentials)
+        .endpoint_url(&cfg.endpoint)
+        .load()
+        .await;
+    let client = aws_sdk_s3::Client::new(&s3_config);
+
+    // 列出备份目录下所有 sqlite_*.db 文件，取最新的
+    let resp = client.list_objects_v2()
+        .bucket(&cfg.bucket)
+        .prefix(&cfg.prefix)
+        .send()
+        .await
+        .map_err(|e| format!("list backup objects: {}", e))?;
+
+    let backups: Vec<&aws_sdk_s3::types::Object> = resp.contents().iter()
+        .filter(|o| o.key().map_or(false, |k| k.contains("sqlite_") && k.ends_with(".db")))
+        .collect();
+
+    let latest = backups.iter()
+        .max_by_key(|o| o.last_modified())
+        .ok_or_else(|| "no backup found on S3".to_string())?;
+
+    let key = latest.key().ok_or_else(|| "backup object key missing".to_string())?;
+    tracing::info!("Downloading latest backup: {}", key);
+
+    // 确保父目录存在
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create db parent dir: {}", e))?;
+    }
+
+    let resp = client.get_object()
+        .bucket(&cfg.bucket)
+        .key(key)
+        .send()
+        .await
+        .map_err(|e| format!("download backup: {}", e))?;
+
+    let body = resp.body;
+    let data = body.collect().await
+        .map_err(|e| format!("download backup: {}", e))?;
+    let bytes = data.into_bytes();
+    tokio::fs::write(db_path, &bytes).await
+        .map_err(|e| format!("write db file: {}", e))?;
+
+    tracing::info!("Restored database from S3 backup: {}", key);
+    Ok(())
 }
 
 // ─── 后台自动备份 ───────────────────────────────────────────
