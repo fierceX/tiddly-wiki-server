@@ -25,3 +25,12 @@ region = "auto"
 bucket_name = "your-wiki-assets"
 # 你的资源公开访问域名
 public_url_base = "https://assets.your-domain.com"
+
+# [可选] 自动备份到 S3
+# 启用后，服务器定期检查变更并自动备份到 S3
+[backup]
+enable = false                         # 启用自动备份
+interval_hours = 24                    # 检查间隔（小时）
+retention_count = 7                    # S3 保留最近 N 个备份
+s3_bucket = "wiki-backups"            # 备份目标 bucket（复用上方 [s3] 的凭证）
+s3_prefix = "backups/"                # 对象存储前缀
