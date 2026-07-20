@@ -10,10 +10,10 @@
 //! [web server API]: https://tiddlywiki.com/#WebServer
 //! [SQLite]: https://sqlite.org/index.html
 
-use aws_config::{meta::region::RegionProviderChain, BehaviorVersion};
+use aws_config::BehaviorVersion;
 use aws_sdk_s3::{config::Credentials, config::Region, presigning::PresigningConfig, Client as S3Client};
 use axum::{
-    Extension, Router, extract::{self, DefaultBodyLimit, Request}, http::{StatusCode, header}, middleware::{self, Next}, response::Response, routing::{delete, get, post, put}
+    Extension, Router, extract::{self, DefaultBodyLimit, Request}, http::{StatusCode, header}, middleware::{self, Next}, response::Response, routing::{delete, get, put}
 };
 
 use axum::{
@@ -22,11 +22,8 @@ use axum::{
     response::{IntoResponse},
 };
 
-use axum::http::{HeaderValue, header::CONTENT_SECURITY_POLICY};
 use chrono::{Local, Utc};
-use tower_http::set_header::SetResponseHeaderLayer; // 引入修改响应头的层
 use clap::Parser;
-use rusqlite::params;
 use rusqlite::Connection;
 use rusqlite::backup::Backup;
 use serde::{Deserialize, Serialize};
@@ -41,7 +38,7 @@ use std::{
 use tokio::fs;
 use tokio::sync::Mutex;
 use tower_http::{services::ServeDir, trace::TraceLayer};
-use tracing_subscriber::{EnvFilter, layer::{self, SubscriberExt}, util::SubscriberInitExt};
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 use base64::{engine::general_purpose, Engine as _};
 use tower_http::compression::CompressionLayer;
 
@@ -1641,107 +1638,8 @@ impl Tiddler {
         }
         true
     }
-
-    /// Agent 友好的规范化输出格式
-    /// - tags: 统一为数组
-    /// - revision: 数字类型
-    /// - 时间: ISO 8601
-    /// - fields 展平
-    pub(crate) fn as_agent_value(&self) -> Value {
-        let mut map = serde_json::Map::new();
-
-        map.insert("title".into(), Value::String(self.title.clone()));
-        map.insert("revision".into(), Value::Number(self.revision.into()));
-
-        // 展平 fields 子对象
-        let flat = self.flatten_fields();
-
-        // text
-        if let Some(text) = flat.get("text").and_then(|v| v.as_str()) {
-            map.insert("text".into(), Value::String(text.to_string()));
-        }
-
-        // tags: 统一为数组
-        if let Some(tags_str) = flat.get("tags").and_then(|v| v.as_str()) {
-            let tags: Vec<Value> = parse_tags(tags_str)
-                .into_iter()
-                .map(Value::String)
-                .collect();
-            map.insert("tags".into(), Value::Array(tags));
-        }
-
-        // 时间：统一为 ISO 8601
-        for time_field in &["created", "modified"] {
-            if let Some(ts) = flat.get(*time_field).and_then(|v| v.as_str()) {
-                if let Some(iso) = tw_to_iso8601(ts) {
-                    map.insert(time_field.to_string(), Value::String(iso));
-                }
-            }
-        }
-
-        // item_type
-        if let Some(it) = flat.get("item_type").and_then(|v| v.as_str()) {
-            map.insert("item_type".into(), Value::String(it.to_string()));
-        }
-
-        // type (MIME)
-        if let Some(t) = flat.get("type").and_then(|v| v.as_str()) {
-            map.insert("type".into(), Value::String(t.to_string()));
-        }
-
-        Value::Object(map)
-    }
-
-    fn flatten_fields(&self) -> serde_json::Map<String, Value> {
-        let mut map = match self.meta.clone() {
-            Value::Object(m) => m,
-            _ => return serde_json::Map::new(),
-        };
-        if let Some(Value::Object(fields)) = map.remove("fields") {
-            for (k, v) in fields {
-                map.entry(k).or_insert(v);
-            }
-        }
-        map
-    }
 }
 
-/// 解析 TiddlyWiki 标签字符串 "tag1 tag2 [[multi word tag]]"
-fn parse_tags(tags_str: &str) -> Vec<String> {
-    let mut tags = Vec::new();
-    let mut current = String::new();
-    let mut in_bracket = false;
-    for ch in tags_str.chars() {
-        match ch {
-            '[' if !in_bracket => in_bracket = true,
-            ']' if in_bracket => in_bracket = false,
-            ' ' if !in_bracket => {
-                if !current.is_empty() {
-                    tags.push(std::mem::take(&mut current));
-                }
-            }
-            c if c != '[' && c != ']' => current.push(c),
-            _ => {}
-        }
-    }
-    if !current.is_empty() {
-        tags.push(current);
-    }
-    tags
-}
-
-/// TW 17 位时间戳 → ISO 8601
-fn tw_to_iso8601(ts: &str) -> Option<String> {
-    if ts.len() != 17 { return None; }
-    let y: i32 = ts[0..4].parse().ok()?;
-    let m: u32 = ts[4..6].parse().ok()?;
-    let d: u32 = ts[6..8].parse().ok()?;
-    let h: u32 = ts[8..10].parse().ok()?;
-    let min: u32 = ts[10..12].parse().ok()?;
-    let s: u32 = ts[12..14].parse().ok()?;
-    let ms: u32 = ts[14..17].parse().ok()?;
-    Some(format!("{}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z", y, m, d, h, min, s, ms))
-}
 
 // -----------------------------------------------------------------------------------
 

@@ -234,7 +234,7 @@ impl WikiClient {
         let base_url = std::env::var("WIKI_SERVER_URL")
             .unwrap_or_else(|_| "http://localhost:3032".to_string());
         let username = std::env::var("WIKI_USERNAME").unwrap_or_default();
-        let password = std::env::var("WIKI_PASSWORD").unwrap_or_default();
+        let _password = std::env::var("WIKI_PASSWORD").unwrap_or_default();
 
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(30))
@@ -355,7 +355,7 @@ impl WikiClient {
         self.get_json(&format!("/api/tiddlers?title={}", title_enc), &[])
     }
 
-    fn put(&self, title: &str, content: &str, tags: Option<&str>, item_type: &str) -> Result<u16, String> {
+    fn put(&self, title: &str, content: &str, tags: Option<&str>, _item_type: &str) -> Result<u16, String> {
         // 先尝试获取现有条目获取 revision
         let (revision, created, creator) = match self.get(title) {
             Ok(v) => {
