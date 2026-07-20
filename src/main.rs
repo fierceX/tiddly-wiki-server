@@ -986,17 +986,22 @@ async fn render_wiki(
     let datastore = &mut *ds_lock;
 
     let tiddlers: Vec<Tiddler> = datastore.all()?;
-    let db_json_values: Vec<serde_json::Value> = tiddlers.iter().map(|t| t.as_value()).collect();
-    let db_json_str = serde_json::to_string(&db_json_values)
-        .map_err(|e| AppError::Serialization(format!("error serializing db: {}", e)))?;
 
-    let inner_json = &db_json_str[1..db_json_str.len() - 1];
-    let safe_json = inner_json.replace("</script>", "<\\/script>");
-
-    let mut buffer = Vec::with_capacity(template.prefix.len() + safe_json.len() + template.suffix.len() + 1);
+    // 流式写入：逐条序列化，避免中间 Vec<Value> + 完整 JSON 字符串的双倍内存
+    let mut buffer = Vec::with_capacity(
+        template.prefix.len() + template.suffix.len() + 8192
+    );
     buffer.extend(template.prefix.as_bytes());
     buffer.push(b',');
-    buffer.extend(safe_json.as_bytes());
+
+    for (i, t) in tiddlers.iter().enumerate() {
+        if i > 0 { buffer.push(b','); }
+        let json = serde_json::to_string(&t.as_value())
+            .map_err(|e| AppError::Serialization(format!("error serializing db: {}", e)))?;
+        // 在序列化后的字符串中直接转义 </script>，避免 replace 整份复制
+        buffer.extend(json.replace("</script>", "<\\/script>").as_bytes());
+    }
+
     buffer.extend(template.suffix.as_bytes());
 
     Response::builder()
