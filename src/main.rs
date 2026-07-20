@@ -656,26 +656,29 @@ async fn check_existing_backup(client: &aws_sdk_s3::Client, bucket: &str, prefix
     }
 }
 
-/// 检查数据库是否有变更（比较当前 max modified 与上次备份记录）
+/// 检查数据库是否有变更（比较条目数和最大 revision 与上次备份记录）
+/// 使用表中的 native 列 count + max(revision)，不依赖 JSON 解析
 async fn check_for_changes(client: &aws_sdk_s3::Client, bucket: &str, prefix: &str, db_path: &std::path::Path) -> Result<bool, String> {
-    // 1. 从 S3 获取上次备份的 max_modified
+    // 1. 从 S3 获取上次备份的 checkpoint（格式 "count,max_revision"）
     let marker_key = format!("{}_checkpoint.txt", prefix.trim_end_matches('/'));
-    let last_max_modified = match client.get_object().bucket(bucket).key(&marker_key).send().await {
+    let last_checkpoint = match client.get_object().bucket(bucket).key(&marker_key).send().await {
         Ok(resp) => {
             let bytes = resp.body.collect().await.map_err(|e| format!("read checkpoint: {}", e))?;
             String::from_utf8_lossy(&bytes.into_bytes()).trim().to_string()
         }
         Err(_) => String::new(), // 无 checkpoint → 需要备份
     };
-    // 2. 查询数据库当前 max modified（直接用 SQL 聚合，避免加载全量 meta）
-    let conn = rusqlite::Connection::open(db_path).map_err(|e| format!("open db: {}", e))?;
-    let current_max: String = conn.query_row(
-        "SELECT IFNULL(MAX(json_extract(meta, '$.modified')), '') FROM tiddlers",
-        [],
-        |r| r.get(0),
-    ).map_err(|e| format!("query max modified: {}", e))?;
 
-    Ok(!current_max.is_empty() && current_max != last_max_modified)
+    // 2. 查询数据库当前 count 和 max(revision)
+    let conn = rusqlite::Connection::open(db_path).map_err(|e| format!("open db: {}", e))?;
+    let current: (i64, i64) = conn.query_row(
+        "SELECT COUNT(*), IFNULL(MAX(revision), 0) FROM tiddlers",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    ).map_err(|e| format!("query db state: {}", e))?;
+    let current_checkpoint = format!("{},{}", current.0, current.1);
+
+    Ok(!last_checkpoint.is_empty() && current_checkpoint != last_checkpoint)
 }
 
 /// 执行备份并上传到 S3
@@ -699,14 +702,15 @@ async fn do_backup_and_upload(
             .map_err(|e| format!("backup run: {}", e))?;
     }
 
-    // 2. 获取当前最大 modified 时间戳（直接用 SQL 聚合，避免加载全量 meta）
-    let max_modified: String = {
+    // 2. 获取当前数据库状态（count + max revision）作为变更检测 checkpoint
+    let checkpoint: String = {
         let conn = Connection::open(db_path).map_err(|e| format!("open db for meta: {}", e))?;
-        conn.query_row(
-            "SELECT IFNULL(MAX(json_extract(meta, '$.modified')), '') FROM tiddlers",
+        let (count, max_rev): (i64, i64) = conn.query_row(
+            "SELECT COUNT(*), IFNULL(MAX(revision), 0) FROM tiddlers",
             [],
-            |r| r.get(0),
-        ).map_err(|e| format!("query max modified: {}", e))?
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).map_err(|e| format!("query db state: {}", e))?;
+        format!("{},{}", count, max_rev)
     };
 
     // 3. 上传数据库备份到 S3
@@ -724,13 +728,13 @@ async fn do_backup_and_upload(
 
     tracing::info!("Auto-backup: uploaded to s3://{}/{}", bucket, s3_key);
 
-    // 4. 上传 checkpoint（记录 max_modified 供变更检测）
-    if !max_modified.is_empty() {
+    // 4. 上传 checkpoint（记录 count + max_revision 供变更检测）
+    if !checkpoint.is_empty() {
         let marker_key = format!("{}_checkpoint.txt", prefix.trim_end_matches('/'));
         client.put_object()
             .bucket(bucket)
             .key(&marker_key)
-            .body(ByteStream::from(max_modified.clone().into_bytes()))
+            .body(ByteStream::from(checkpoint.clone().into_bytes()))
             .send()
             .await
             .map_err(|e| format!("S3 upload checkpoint failed: {}", e))?;
