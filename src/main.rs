@@ -28,6 +28,7 @@ use tower_http::set_header::SetResponseHeaderLayer; // 引入修改响应头的�
 use clap::Parser;
 use rusqlite::params;
 use rusqlite::Connection;
+use rusqlite::backup::Backup;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -69,7 +70,29 @@ struct AppConfig {
     #[serde(default = "default_status_config")] 
     status: Status, 
     auth: Option<AuthConfig>, 
+    #[serde(default)]
+    backup: BackupConfig,
 }
+
+#[derive(Deserialize, Debug, Clone, Default)]
+struct BackupConfig {
+    #[serde(default = "default_backup_enable")]
+    enable: bool,
+    #[serde(default = "default_backup_interval")]
+    interval_hours: u64,
+    #[serde(default = "default_backup_retention")]
+    retention_count: usize,
+    #[serde(default = "default_backup_s3_bucket")]
+    s3_bucket: String,
+    #[serde(default = "default_backup_s3_prefix")]
+    s3_prefix: String,
+}
+
+fn default_backup_enable() -> bool { false }
+fn default_backup_interval() -> u64 { 24 }
+fn default_backup_retention() -> usize { 7 }
+fn default_backup_s3_bucket() -> String { String::new() }
+fn default_backup_s3_prefix() -> String { "backups/".to_string() }
 
 fn default_status_config() -> Status {
     Status {
@@ -412,6 +435,16 @@ async fn main() {
         public_url_base: config.s3.public_url_base.clone(),
     });
 
+    // 5b. 后台自动备份任务
+    if config.backup.enable {
+        let server_cfg = config.server.clone();
+        let backup_cfg = config.backup.clone();
+        let state = app_state.clone();
+        tokio::spawn(async move {
+            run_auto_backup(server_cfg, backup_cfg, state).await;
+        });
+    }
+
     let files_service = ServeDir::new(&config.server.files_dir);
     let addr = SocketAddr::from((config.server.bind, config.server.port));
 
@@ -458,6 +491,223 @@ async fn main() {
     axum::serve(listener, app).await.expect("Error serving app");
 }
 
+// ─── 后台自动备份 ───────────────────────────────────────────
+
+async fn run_auto_backup(server: ServerConfig, cfg: BackupConfig, state: Arc<AppState>) {
+    // 等待服务器稳定
+    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+
+    if state.s3_client.is_none() {
+        tracing::warn!("Auto-backup: S3 client not available, backup disabled");
+        return;
+    }
+    let client = state.s3_client.as_ref().unwrap();
+    let bucket = &cfg.s3_bucket;
+    if bucket.is_empty() {
+        tracing::warn!("Auto-backup: s3_bucket is empty, backup disabled");
+        return;
+    }
+
+    tracing::info!("Auto-backup started (interval: {}h, retention: {})", cfg.interval_hours, cfg.retention_count);
+
+    // 首次备份：检查 S3 上是否有已有备份
+    let has_backup = check_existing_backup(client, bucket, &cfg.s3_prefix).await;
+    if !has_backup {
+        tracing::info!("Auto-backup: no existing backup found, performing initial backup");
+        if let Err(e) = do_backup_and_upload(client, bucket, &cfg.s3_prefix, &server.db_path).await {
+            tracing::error!("Auto-backup: initial backup failed: {}", e);
+        }
+    } else {
+        tracing::info!("Auto-backup: found existing backup on S3, entering monitoring loop");
+    }
+
+    let interval_dur = std::time::Duration::from_secs(cfg.interval_hours * 3600);
+
+    loop {
+        tokio::time::sleep(interval_dur).await;
+
+        // 检查是否有变更
+        let changed = match check_for_changes(client, bucket, &cfg.s3_prefix, &server.db_path).await {
+            Ok(true) => true,
+            Ok(false) => {
+                tracing::info!("Auto-backup: no changes detected, skipping");
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!("Auto-backup: change detection failed (will still backup): {}", e);
+                true
+            }
+        };
+
+        if !changed {
+            continue;
+        }
+
+        tracing::info!("Auto-backup: changes detected, starting backup");
+        if let Err(e) = do_backup_and_upload(client, bucket, &cfg.s3_prefix, &server.db_path).await {
+            tracing::error!("Auto-backup: backup failed: {}", e);
+            continue;
+        }
+
+        // 清理旧备份（保留最近 N 个）
+        if let Err(e) = rotate_backups(client, bucket, &cfg.s3_prefix, cfg.retention_count).await {
+            tracing::warn!("Auto-backup: rotation failed: {}", e);
+        }
+    }
+}
+
+/// 检查 S3 上是否已有备份文件
+async fn check_existing_backup(client: &aws_sdk_s3::Client, bucket: &str, prefix: &str) -> bool {
+    let resp = client.list_objects_v2().bucket(bucket).prefix(prefix).max_keys(1).send().await;
+    match resp {
+        Ok(r) => !r.contents().is_empty(),
+        Err(e) => {
+            tracing::warn!("Auto-backup: cannot list S3 objects: {}", e);
+            false
+        }
+    }
+}
+
+/// 检查数据库是否有变更（比较当前 max modified 与上次备份记录）
+async fn check_for_changes(client: &aws_sdk_s3::Client, bucket: &str, prefix: &str, db_path: &std::path::Path) -> Result<bool, String> {
+    // 1. 从 S3 获取上次备份的 max_modified
+    let marker_key = format!("{}_checkpoint.txt", prefix.trim_end_matches('/'));
+    let last_max_modified = match client.get_object().bucket(bucket).key(&marker_key).send().await {
+        Ok(resp) => {
+            let bytes = resp.body.collect().await.map_err(|e| format!("read checkpoint: {}", e))?;
+            String::from_utf8_lossy(&bytes.into_bytes()).trim().to_string()
+        }
+        Err(_) => String::new(), // 无 checkpoint → 需要备份
+    };
+
+    // 2. 查询数据库当前 max modified
+    let conn = rusqlite::Connection::open(db_path).map_err(|e| format!("open db: {}", e))?;
+    // meta 是 JSON blob，我们查询所有 meta 然后在 Rust 中解析
+    let mut stmt = conn.prepare("SELECT meta FROM tiddlers")
+        .map_err(|e| format!("prepare: {}", e))?;
+    let rows: Vec<serde_json::Value> = stmt.query_map([], |r| {
+        r.get::<usize, serde_json::Value>(0)
+    }).map_err(|e| format!("query: {}", e))?
+    .filter_map(|r| r.ok())
+    .collect();
+
+    let current_max = rows.iter()
+        .filter_map(|v| v.get("modified").and_then(|m| m.as_str()))
+        .max()
+        .unwrap_or("")
+        .to_string();
+
+    Ok(!current_max.is_empty() && current_max != last_max_modified)
+}
+
+/// 执行备份并上传到 S3
+async fn do_backup_and_upload(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    prefix: &str,
+    db_path: &std::path::Path,
+) -> Result<(), String> {
+    use aws_sdk_s3::primitives::ByteStream;
+    // 1. 备份到临时文件（嵌套块确保 backup 借用在 drop 前结束）
+    let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+    let tmp_dir = std::env::temp_dir();
+    let tmp_path = tmp_dir.join(format!("tiddlywiki_backup_{}.db", timestamp));
+
+    {
+        let src = Connection::open(db_path).map_err(|e| format!("open source db: {}", e))?;
+        let mut dst = Connection::open(&tmp_path).map_err(|e| format!("create temp db: {}", e))?;
+        let backup = Backup::new(&src, &mut dst).map_err(|e| format!("backup init: {}", e))?;
+        backup.run_to_completion(100, std::time::Duration::from_millis(250), None)
+            .map_err(|e| format!("backup run: {}", e))?;
+    }
+
+    // 2. 获取当前最大 modified 时间戳（在单独的同步块中完成，确保 conn 在 await 前释放）
+    let max_modified = {
+        let conn = Connection::open(db_path).map_err(|e| format!("open db for meta: {}", e))?;
+        let mut stmt = conn.prepare("SELECT meta FROM tiddlers").map_err(|e| format!("prepare meta: {}", e))?;
+        let rows: Vec<serde_json::Value> = stmt.query_map([], |r| {
+            r.get::<usize, serde_json::Value>(0)
+        }).map_err(|e| format!("query meta: {}", e))?
+        .filter_map(|r| r.ok())
+        .collect();
+        drop(stmt);
+        drop(conn);
+        rows.iter()
+            .filter_map(|v| v.get("modified").and_then(|m| m.as_str()))
+            .max()
+            .unwrap_or("")
+            .to_string()
+    };
+
+    // 3. 上传数据库备份到 S3
+    let s3_key = format!("{}sqlite_{}.db", prefix, timestamp);
+    let body = ByteStream::from_path(&tmp_path).await
+        .map_err(|e| format!("read temp file: {}", e))?;
+
+    client.put_object()
+        .bucket(bucket)
+        .key(&s3_key)
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| format!("S3 upload failed: {}", e))?;
+
+    tracing::info!("Auto-backup: uploaded to s3://{}/{}", bucket, s3_key);
+
+    // 4. 上传 checkpoint（记录 max_modified 供变更检测）
+    if !max_modified.is_empty() {
+        let marker_key = format!("{}_checkpoint.txt", prefix.trim_end_matches('/'));
+        client.put_object()
+            .bucket(bucket)
+            .key(&marker_key)
+            .body(ByteStream::from(max_modified.clone().into_bytes()))
+            .send()
+            .await
+            .map_err(|e| format!("S3 upload checkpoint failed: {}", e))?;
+    }
+
+    // 5. 清理临时文件
+    let _ = std::fs::remove_file(&tmp_path);
+
+    Ok(())
+}
+
+/// 轮转删除旧备份，只保留最近 retention_count 个
+async fn rotate_backups(client: &aws_sdk_s3::Client, bucket: &str, prefix: &str, keep: usize) -> Result<(), String> {
+    // 列出所有 backup 对象
+    let resp = client.list_objects_v2().bucket(bucket).prefix(prefix).send().await
+        .map_err(|e| format!("list objects: {}", e))?;
+
+    let mut objects: Vec<String> = resp.contents().iter()
+        .filter_map(|obj| {
+            let key = obj.key()?;
+            // 只匹配 sqlite_*.db 文件
+            if key.contains("sqlite_") && key.ends_with(".db") {
+                Some(key.to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if objects.len() <= keep {
+        return Ok(()); // 不需要清理
+    }
+
+    // 按 key 排序（命名含时间戳 YYYYMMDD_HHMMSS，字典序=时间序）
+    objects.sort();
+
+    // 删除最旧的 (len - keep) 个
+    let to_delete = objects.len() - keep;
+    for key in objects.iter().take(to_delete) {
+        client.delete_object().bucket(bucket).key(key).send().await
+            .map_err(|e| format!("delete {} failed: {}", key, e))?;
+        tracing::debug!("Auto-backup: deleted old backup {}", key);
+    }
+
+    tracing::info!("Auto-backup: rotation complete (deleted {}, kept {})", to_delete, keep);
+    Ok(())
+}
 fn insert_default_data(str:&str,conn: &Connection) -> Result<(), AppError> {
     tracing::info!("Installing plugin...");
     let v: serde_json::Value = serde_json::from_str(str)

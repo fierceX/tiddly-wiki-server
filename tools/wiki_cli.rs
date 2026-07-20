@@ -6,13 +6,18 @@
 //!   WIKI_SERVER_URL  (默认 http://localhost:3032)
 //!   WIKI_USERNAME
 //!   WIKI_PASSWORD
+//!   WIKI_BACKUP_CONFIG (default config.toml) — 本地备份时指定配置文件路径
 
 use clap::{Parser, Subcommand};
-use chrono::Utc;
+use chrono::{Utc, Local};
 use reqwest::blocking::Client;
+use rusqlite::backup::Backup;
+use rusqlite::Connection;
+use serde::{Deserialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
+use std::path::PathBuf;
 use std::time::Duration;
 
 // ─── CLI 参数结构 ──────────────────────────────────────────
@@ -142,6 +147,78 @@ enum Commands {
         depth: usize,
         #[arg(long)]
         plain: bool,
+    },
+    /// 备份操作（直接访问数据库，不依赖 HTTP API）
+    Backup {
+        #[command(subcommand)]
+        action: BackupAction,
+        /// 配置文件路径（用于读取 db_path）
+        #[arg(short, long, default_value = "config.toml")]
+        config: PathBuf,
+    },
+    /// 导出条目（直接访问数据库，不依赖 HTTP API）
+    Export {
+        #[command(subcommand)]
+        action: ExportAction,
+        /// 配置文件路径（用于读取 db_path）
+        #[arg(short, long, default_value = "config.toml")]
+        config: PathBuf,
+    },
+    /// 导入条目（从 HTML 或 .tid 文件夹导入到数据库）
+    Import {
+        #[command(subcommand)]
+        action: ImportAction,
+        /// 配置文件路径（用于读取 db_path）
+        #[arg(short, long, default_value = "config.toml")]
+        config: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum ExportAction {
+    /// 导出为独立 TiddlyWiki HTML 文件（可浏览器直接打开）
+    Html {
+        /// 输出 HTML 文件路径（默认: wiki_export_<日期>.html）
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+    /// 导出为 .tid 文件夹（Node.js TiddlyWiki 服务器兼容）
+    Folder {
+        /// 输出目录路径（默认: wiki_export_<日期>/）
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ImportAction {
+    /// 从 TiddlyWiki HTML 文件导入
+    Html {
+        /// 输入的 HTML 文件路径
+        #[arg(short, long)]
+        input: String,
+    },
+    /// 从 .tid 文件夹导入（Node.js TiddlyWiki 服务器兼容）
+    Folder {
+        /// 输入的文件夹路径
+        #[arg(short, long)]
+        input: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum BackupAction {
+    /// 导出 SQLite 数据库文件（一致性快照，通过 SQLite backup API）
+    Db {
+        /// 输出文件路径（默认: tiddlers_backup_<日期>.db）
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+    /// 导出所有条目为标准 TiddlyWiki JSON 格式
+    Tiddlers {
+        /// 输出文件路径（默认: tiddlers_export_<日期>.json）
+        #[arg(short, long)]
+        output: Option<String>,
     },
 }
 
@@ -611,6 +688,416 @@ fn cmd_graph(client: &WikiClient, args: &Commands) -> Result<(), String> {
     Ok(())
 }
 
+// ─── 备份工具 ────────────────────────────────────────────────
+
+#[derive(Deserialize, Debug)]
+struct CliServerConfig {
+    db_path: PathBuf,
+}
+
+#[derive(Deserialize, Debug)]
+struct CliAppConfig {
+    server: CliServerConfig,
+}
+
+fn load_cli_config(config_path: &std::path::Path) -> Result<CliAppConfig, String> {
+    let content = fs::read_to_string(config_path)
+        .map_err(|e| format!("无法读取配置文件 '{}': {}", config_path.display(), e))?;
+    toml::from_str(&content)
+        .map_err(|e| format!("解析配置文件失败: {}", e))
+}
+
+fn default_backup_db_path() -> String {
+    let now = Local::now().format("%Y%m%d_%H%M%S");
+    format!("tiddlers_backup_{}.db", now)
+}
+
+fn default_backup_tiddlers_path() -> String {
+    let now = Local::now().format("%Y%m%d_%H%M%S");
+    format!("tiddlers_export_{}.json", now)
+}
+
+fn cmd_backup(config_path: &std::path::Path, action: &BackupAction) -> Result<(), String> {
+    let cfg = load_cli_config(config_path)?;
+    let db_path = cfg.server.db_path;
+
+    match action {
+        BackupAction::Db { output } => {
+            let out_path = output.clone().unwrap_or_else(default_backup_db_path);
+            // 用嵌套块确保 backup borrow 在 close 前结束
+            {
+                let src = Connection::open(&db_path)
+                    .map_err(|e| format!("无法打开源数据库 {:?}: {}", db_path, e))?;
+                let mut dst = Connection::open(&out_path)
+                    .map_err(|e| format!("无法创建备份文件 '{}': {}", out_path, e))?;
+                let backup = Backup::new(&src, &mut dst)
+                    .map_err(|e| format!("备份初始化失败: {}", e))?;
+                backup.run_to_completion(100, std::time::Duration::from_millis(250), None)
+                    .map_err(|e| format!("备份执行失败: {}", e))?;
+                // block end → backup, dst, src 按逆序 drop
+            }
+
+            let size = std::fs::metadata(&out_path)
+                .map(|m| m.len())
+                .unwrap_or(0);
+            println!("✅ 数据库备份完成: {}", out_path);
+            println!("   大小: {} bytes", size);
+        }
+        BackupAction::Tiddlers { output } => {
+            let out_path = output.clone().unwrap_or_else(default_backup_tiddlers_path);
+            let conn = Connection::open(&db_path)
+                .map_err(|e| format!("无法打开数据库 {:?}: {}", db_path, e))?;
+
+            let mut stmt = conn.prepare("SELECT meta FROM tiddlers")
+                .map_err(|e| format!("查询失败: {}", e))?;
+            let rows: Vec<serde_json::Value> = stmt.query_map([], |r| {
+                r.get::<usize, serde_json::Value>(0)
+            }).map_err(|e| format!("读取数据失败: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+            let json_out = serde_json::to_string_pretty(&rows)
+                .map_err(|e| format!("序列化失败: {}", e))?;
+            fs::write(&out_path, &json_out)
+                .map_err(|e| format!("写入文件失败 '{}': {}", out_path, e))?;
+
+            println!("✅ 条目导出完成: {}", out_path);
+            println!("   条目数: {}", rows.len());
+        }
+    }
+    Ok(())
+}
+
+// ─── 导出工具 ────────────────────────────────────────────────
+
+fn cmd_export_html(config_path: &std::path::Path, action: &ExportAction) -> Result<(), String> {
+    let cfg = load_cli_config(config_path)?;
+    let db_path = cfg.server.db_path;
+
+    let ExportAction::Html { output } = action else { unreachable!() };
+    let out_path = output.clone().unwrap_or_else(|| {
+        let now = Local::now().format("%Y%m%d_%H%M%S");
+        format!("wiki_export_{}.html", now)
+    });
+
+    // 1. 从数据库中读取所有条目并规范化（与服务器 render_wiki 的 as_value 一致）
+    let conn = Connection::open(&db_path)
+        .map_err(|e| format!("无法打开数据库 {:?}: {}", db_path, e))?;
+    let mut stmt = conn.prepare("SELECT title, revision, meta FROM tiddlers")
+        .map_err(|e| format!("查询失败: {}", e))?;
+    let tiddlers: Vec<(String, u64, serde_json::Value)> = stmt.query_map([], |r| {
+        Ok((r.get::<usize, String>(0)?, r.get::<usize, u64>(1)?, r.get::<usize, serde_json::Value>(2)?))
+    }).map_err(|e| format!("读取数据失败: {}", e))?
+    .filter_map(|r| r.ok())
+    .collect();
+
+    // 对每个条目应用 as_value 转换（确保 title/revision/bag 字段正确）
+    let mut normalized: Vec<serde_json::Value> = Vec::with_capacity(tiddlers.len());
+    for (title, revision, meta) in &tiddlers {
+        if let Some(obj) = meta.as_object() {
+            let mut map = obj.clone();
+            // 展平 fields 子对象
+            if let Some(serde_json::Value::Object(fields)) = map.remove("fields") {
+                for (k, v) in fields {
+                    map.entry(k).or_insert(v);
+                }
+            }
+            // tags 数组转字符串
+            if let Some(tags_val) = map.get("tags") {
+                match tags_val {
+                    serde_json::Value::Array(arr) => {
+                        let tag_str: Vec<String> = arr.iter()
+                            .filter_map(|v| v.as_str())
+                            .map(|s| if s.contains(' ') { format!("[[{}]]", s) } else { s.to_string() })
+                            .collect();
+                        map.insert("tags".to_string(), serde_json::Value::String(tag_str.join(" ")));
+                    },
+                    _ => {}
+                }
+            }
+            // 确保 title/revision/bag 存在
+            map.insert("title".to_string(), serde_json::Value::String(title.clone()));
+            map.insert("revision".to_string(), serde_json::Value::String(revision.to_string()));
+            map.entry("bag".to_string()).or_insert(serde_json::Value::String("default".to_string()));
+            normalized.push(serde_json::Value::Object(map));
+        } else {
+            // 非 Object 的 meta 原始输出
+            normalized.push(meta.clone());
+        }
+    }
+    // 2. 解析模板中的 store JSON，与数据库条目合并（数据库版本覆盖模板版本）
+    let html_content = include_str!("../empty.html");
+    let store_marker = r#"<script class="tiddlywiki-tiddler-store" type="application/json">"#;
+    let start_tag_idx = html_content.find(store_marker)
+        .ok_or_else(|| "Invalid empty.html: missing store script tag".to_string())?;
+    let tag_open_end = start_tag_idx + store_marker.len();
+    let close_tag_idx = html_content[tag_open_end..]
+        .find("</script>")
+        .map(|i| tag_open_end + i)
+        .ok_or_else(|| "Invalid empty.html: missing closing script tag".to_string())?;
+
+    let template_store: Vec<serde_json::Value> = serde_json::from_str(
+        html_content[tag_open_end..close_tag_idx].trim()
+    ).map_err(|e| format!("解析模板 store JSON 失败: {}", e))?;
+
+    // 用数据库条目覆盖同名的模板条目（保持 $:/core 等核心条目）
+    let mut merged: Vec<serde_json::Value> = template_store;
+    let mut db_by_title: std::collections::HashMap<&str, &serde_json::Value> = std::collections::HashMap::new();
+    for t in &normalized {
+        if let Some(title) = t.get("title").and_then(|v| v.as_str()) {
+            db_by_title.insert(title, t);
+        }
+    }
+    for t in merged.iter_mut() {
+        if let Some(title) = t.get("title").and_then(|v| v.as_str()) {
+            if let Some(db_val) = db_by_title.get(title) {
+                *t = (*db_val).clone();
+            }
+        }
+    }
+    // 添加仅存在于数据库的条目（克隆标题集合避免借用冲突）
+    let merged_titles: std::collections::HashSet<String> = merged.iter()
+        .filter_map(|t| t.get("title").and_then(|v| v.as_str()).map(String::from))
+        .collect();
+    for t in &normalized {
+        if let Some(title) = t.get("title").and_then(|v| v.as_str()) {
+            if !merged_titles.contains(title) {
+                merged.push(t.clone());
+            }
+        }
+    }
+
+    // 3. 构建完整 HTML
+    let prefix = &html_content[..tag_open_end];
+    let suffix = &html_content[close_tag_idx..];
+
+    let merged_json = serde_json::to_string(&merged)
+        .map_err(|e| format!("序列化失败: {}", e))?;
+    let safe_json = merged_json.replace("</script>", "<\\/script>");
+
+    let mut buffer = String::with_capacity(prefix.len() + safe_json.len() + suffix.len() + 2);
+    buffer.push_str(prefix);
+    buffer.push('\n');
+    buffer.push_str(&safe_json);
+    buffer.push('\n');
+    buffer.push_str(suffix);
+
+    fs::write(&out_path, &buffer)
+        .map_err(|e| format!("写入文件失败 '{}': {}", out_path, e))?;
+
+    println!("✅ HTML 导出完成: {}", out_path);
+    println!("   条目数: {}", normalized.len());
+    Ok(())
+}
+
+fn cmd_export_folder(config_path: &std::path::Path, action: &ExportAction) -> Result<(), String> {
+    let cfg = load_cli_config(config_path)?;
+    let db_path = cfg.server.db_path;
+
+    let ExportAction::Folder { output } = action else { unreachable!() };
+    let out_dir = output.clone().unwrap_or_else(|| {
+        let now = Local::now().format("%Y%m%d_%H%M%S");
+        format!("wiki_export_{}", now)
+    });
+
+    let conn = Connection::open(&db_path)
+        .map_err(|e| format!("无法打开数据库 {:?}: {}", db_path, e))?;
+    let mut stmt = conn.prepare("SELECT title, meta FROM tiddlers")
+        .map_err(|e| format!("查询失败: {}", e))?;
+    let tiddlers: Vec<(String, serde_json::Value)> = stmt.query_map([], |r| {
+        Ok((r.get::<usize, String>(0)?, r.get::<usize, serde_json::Value>(1)?))
+    }).map_err(|e| format!("读取数据失败: {}", e))?
+    .filter_map(|r| r.ok())
+    .collect();
+
+    std::fs::create_dir_all(&out_dir)
+        .map_err(|e| format!("创建目录失败 '{}': {}", out_dir, e))?;
+
+    let mut count = 0usize;
+    for (title, meta) in &tiddlers {
+        let safe_title = sanitize_filename(title);
+        let tid_path = std::path::Path::new(&out_dir).join(format!("{}.tid", safe_title));
+
+        // 构建 .tid 文件内容：header 字段 + 空行 + body
+        let mut content = String::new();
+        content.push_str(&format!("title: {}\n", title));
+
+        // 提取常用元数据字段
+        let meta_obj = match meta {
+            serde_json::Value::Object(m) => m,
+            _ => continue,
+        };
+        for field in &["tags", "created", "modified", "creator", "modifier", "type"] {
+            if let Some(serde_json::Value::String(val)) = meta_obj.get(*field) {
+                content.push_str(&format!("{}: {}\n", field, val));
+            }
+        }
+
+        // 字段转写：text 是正文，用空行分隔
+        if let Some(serde_json::Value::String(text)) = meta_obj.get("text") {
+            content.push('\n');
+            content.push_str(text);
+        } else {
+            content.push('\n');
+        }
+
+        fs::write(&tid_path, &content)
+            .map_err(|e| format!("写入 '{}' 失败: {}", safe_title, e))?;
+        count += 1;
+    }
+
+    println!("✅ 文件夹导出完成: {}", out_dir);
+    println!("   条目数: {}", count);
+    Ok(())
+}
+
+fn sanitize_filename(name: &str) -> String {
+    let mut safe = String::with_capacity(name.len());
+    for ch in name.chars() {
+        match ch {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\n' | '\r' => safe.push('_'),
+            _ => safe.push(ch),
+        }
+    }
+    if safe.is_empty() { safe = "_".to_string(); }
+    safe
+}
+
+// ─── 导入工具 ────────────────────────────────────────────────
+
+fn cmd_import_html(config_path: &std::path::Path, action: &ImportAction) -> Result<(), String> {
+    let cfg = load_cli_config(config_path)?;
+    let db_path = cfg.server.db_path;
+
+    let ImportAction::Html { input } = action else { unreachable!() };
+
+    let html = fs::read_to_string(input)
+        .map_err(|e| format!("无法读取 HTML 文件 '{}': {}", input, e))?;
+
+    // 1. 提取 JSON store
+    let store_marker = r#"<script class="tiddlywiki-tiddler-store" type="application/json">"#;
+    let start_idx = html.find(store_marker)
+        .ok_or_else(|| "HTML 中未找到 tiddler store script tag".to_string())?;
+    let json_start = start_idx + store_marker.len();
+    let json_end = html[json_start..].find("</script>")
+        .map(|i| json_start + i)
+        .ok_or_else(|| "未找到 closing script tag".to_string())?;
+    let json_str = &html[json_start..json_end];
+
+    let tiddlers: Vec<serde_json::Value> = serde_json::from_str(json_str)
+        .map_err(|e| format!("解析 tiddler JSON 失败: {}", e))?;
+
+    // 2. 逐个导入
+    let conn = Connection::open(&db_path)
+        .map_err(|e| format!("无法打开数据库 {:?}: {}", db_path, e))?;
+    let mut insert_count = 0usize;
+    let mut skip_count = 0usize;
+
+    for tid in &tiddlers {
+        let title = match tid.get("title").and_then(|v| v.as_str()) {
+            Some(t) => t,
+            None => { skip_count += 1; continue; }
+        };
+
+        // 构建完整的 tiddler JSON（包含 revision）
+        let mut tiddler_obj = tid.clone();
+        if let Some(obj) = tiddler_obj.as_object_mut() {
+            if !obj.contains_key("revision") {
+                obj.insert("revision".to_string(), serde_json::Value::Number(serde_json::Number::from(0u64)));
+            }
+        }
+        let revision: u64 = tiddler_obj.get("revision").map_or(0, |v| match v {
+            serde_json::Value::String(s) => s.parse::<u64>().unwrap_or(0),
+            serde_json::Value::Number(n) => n.as_u64().unwrap_or(0),
+            _ => 0,
+        });
+
+        conn.execute(
+            "INSERT OR REPLACE INTO tiddlers (title, revision, meta) VALUES (?1, ?2, ?3)",
+            rusqlite::params![title, revision, tiddler_obj],
+        ).map_err(|e| format!("写入条目 '{}' 失败: {}", title, e))?;
+        insert_count += 1;
+    }
+
+    println!("✅ HTML 导入完成: {}", input);
+    println!("   导入: {}, 跳过: {}", insert_count, skip_count);
+    Ok(())
+}
+
+fn cmd_import_folder(config_path: &std::path::Path, action: &ImportAction) -> Result<(), String> {
+    let cfg = load_cli_config(config_path)?;
+    let db_path = cfg.server.db_path;
+
+    let ImportAction::Folder { input } = action else { unreachable!() };
+
+    let dir = std::path::Path::new(input);
+    if !dir.is_dir() {
+        return Err(format!("'{}' 不是有效目录", input));
+    }
+
+    let entries = fs::read_dir(dir)
+        .map_err(|e| format!("读取目录失败: {}", e))?;
+
+    let conn = Connection::open(&db_path)
+        .map_err(|e| format!("无法打开数据库 {:?}: {}", db_path, e))?;
+
+    let mut insert_count = 0usize;
+    let mut skip_count = 0usize;
+
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("读取条目失败: {}", e))?;
+        let path = entry.path();
+        if path.extension().map(|e| e == "tid").unwrap_or(false) {
+            let content = fs::read_to_string(&path)
+                .map_err(|e| format!("读取 '{}' 失败: {}", path.display(), e))?;
+
+            // 解析 .tid 文件：header 行直到空行，剩余为 body
+            let mut headers: Vec<(&str, &str)> = Vec::new();
+            let mut body = "";
+            if let Some(blank_pos) = content.find("\n\n") {
+                let header_section = &content[..blank_pos];
+                body = content[blank_pos + 2..].trim();
+                for line in header_section.lines() {
+                    if let Some(pos) = line.find(':') {
+                        let key = line[..pos].trim();
+                        let val = line[pos + 1..].trim();
+                        headers.push((key, val));
+                    }
+                }
+            }
+
+            // 构建 tiddler JSON
+            let mut map = serde_json::Map::new();
+            let mut title = String::new();
+            for (key, val) in &headers {
+                let k = key.to_lowercase();
+                if k == "title" {
+                    title = val.to_string();
+                }
+                map.insert(k.clone(), serde_json::Value::String(val.to_string()));
+            }
+            if title.is_empty() {
+                skip_count += 1;
+                continue;
+            }
+            if !body.is_empty() {
+                map.insert("text".to_string(), serde_json::Value::String(body.to_string()));
+            }
+            map.insert("revision".to_string(), serde_json::Value::Number(serde_json::Number::from(0u64)));
+
+            let tiddler_json = serde_json::Value::Object(map);
+            conn.execute(
+                "INSERT OR REPLACE INTO tiddlers (title, revision, meta) VALUES (?1, ?2, ?3)",
+                rusqlite::params![title, 0u64, tiddler_json],
+            ).map_err(|e| format!("写入条目 '{}' 失败: {}", title, e))?;
+            insert_count += 1;
+        }
+    }
+
+    println!("✅ 文件夹导入完成: {}", input);
+    println!("   导入: {}, 跳过: {}", insert_count, skip_count);
+    Ok(())
+}
 // ─── 主入口 ────────────────────────────────────────────────
 
 fn main() {
@@ -630,6 +1117,19 @@ fn main() {
         Commands::Tags { .. } => cmd_tags(&client, &cli.command),
         Commands::Changes { .. } => cmd_changes(&client, &cli.command),
         Commands::Graph { .. } => cmd_graph(&client, &cli.command),
+        Commands::Backup { config, action } => cmd_backup(config.as_path(), action),
+        Commands::Export { config, action } => {
+            match action {
+                ExportAction::Html { .. } => cmd_export_html(config.as_path(), action),
+                ExportAction::Folder { .. } => cmd_export_folder(config.as_path(), action),
+            }
+        }
+        Commands::Import { config, action } => {
+            match action {
+                ImportAction::Html { .. } => cmd_import_html(config.as_path(), action),
+                ImportAction::Folder { .. } => cmd_import_folder(config.as_path(), action),
+            }
+        }
     };
 
     match result {
