@@ -226,7 +226,9 @@ struct InboxRequest {
     #[serde(default)]
     text: Option<String>, // "text" 字段（别名，Agent 常用此名）
     
-    timestamp: String, // ISO 8601 格式字符串
+    #[serde(default)]
+    #[allow(dead_code)]
+    timestamp: String, // 保留字段兼容旧客户端，实际不再使用
     
     #[serde(default)]
     context: Option<String>,
@@ -1126,23 +1128,15 @@ async fn put_tiddler(
         // ── 更新已有条目 ──
         new_tiddler.revision += 1;
         if let Some(obj) = new_tiddler.meta.as_object_mut() {
-            // 保留原有的 created/creator（客户端没发时）
-            if !obj.contains_key("created") {
-                if let Some(old_v) = old_tiddler.meta.get("created") {
-                    obj.insert("created".to_string(), old_v.clone());
-                } else {
-                    obj.insert("created".to_string(), Value::String(now.clone()));
-                }
+            // created/creator 保留数据库原有值（不被客户端覆盖也不被服务端覆盖）
+            if let Some(old_v) = old_tiddler.meta.get("created") {
+                obj.insert("created".to_string(), old_v.clone());
             }
-            if !obj.contains_key("creator") {
-                if let Some(old_v) = old_tiddler.meta.get("creator") {
-                    obj.insert("creator".to_string(), old_v.clone());
-                }
+            if let Some(old_v) = old_tiddler.meta.get("creator") {
+                obj.insert("creator".to_string(), old_v.clone());
             }
-            // 更新 modified/modifier
-            if !obj.contains_key("modified") {
-                obj.insert("modified".to_string(), Value::String(now.clone()));
-            }
+            // modified/modifier 强制使用服务端时间
+            obj.insert("modified".to_string(), Value::String(now.clone()));
             if !obj.contains_key("modifier") {
                 if let Some(old_v) = old_tiddler.meta.get("modifier") {
                     obj.insert("modifier".to_string(), old_v.clone());
@@ -1152,12 +1146,8 @@ async fn put_tiddler(
     } else {
         // ── 新建条目 ──
         if let Some(obj) = new_tiddler.meta.as_object_mut() {
-            if !obj.contains_key("created") {
-                obj.insert("created".to_string(), Value::String(now.clone()));
-            }
-            if !obj.contains_key("modified") {
-                obj.insert("modified".to_string(), Value::String(now.clone()));
-            }
+            obj.insert("created".to_string(), Value::String(now.clone()));
+            obj.insert("modified".to_string(), Value::String(now.clone()));
             if !obj.contains_key("creator") {
                 obj.insert("creator".to_string(), Value::String(default_username.clone()));
             }
@@ -1166,10 +1156,9 @@ async fn put_tiddler(
             }
         }
     }
-
     let new_revision = new_tiddler.revision;
     tiddlers.put(new_tiddler)?;
-    
+
     Response::builder()
         .status(StatusCode::NO_CONTENT)
         .header("Etag", format!("default/{}/{}:", title, new_revision))
@@ -2043,12 +2032,8 @@ async fn add_inbox_item(
     let tiddlers = &mut *lock;
 
     // --- A. 时间处理 ---
-    // 尝试解析 ISO 8601 时间戳，如果失败则使用服务器当前时间
-    // TiddlyWiki 需要 17 位时间格式: YYYYMMDDhhmmssXXX
-    let created_dt = chrono::DateTime::parse_from_rfc3339(&payload.timestamp)
-        .map(|dt| dt.with_timezone(&chrono::Local))
-        .unwrap_or_else(|_| chrono::Local::now());
-    let tw_timestamp = created_dt.format("%Y%m%d%H%M%S%3f").to_string();
+    // 强制使用服务端时间，忽略客户端传来的 timestamp
+    let tw_timestamp = Local::now().format("%Y%m%d%H%M%S%3f").to_string();
 
     // --- B. 正文与 Context 处理 ---
     // 合并 content 和 text 字段（接受两种 JSON 键名）
