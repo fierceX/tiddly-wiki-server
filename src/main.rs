@@ -667,23 +667,13 @@ async fn check_for_changes(client: &aws_sdk_s3::Client, bucket: &str, prefix: &s
         }
         Err(_) => String::new(), // 无 checkpoint → 需要备份
     };
-
-    // 2. 查询数据库当前 max modified
+    // 2. 查询数据库当前 max modified（直接用 SQL 聚合，避免加载全量 meta）
     let conn = rusqlite::Connection::open(db_path).map_err(|e| format!("open db: {}", e))?;
-    // meta 是 JSON blob，我们查询所有 meta 然后在 Rust 中解析
-    let mut stmt = conn.prepare("SELECT meta FROM tiddlers")
-        .map_err(|e| format!("prepare: {}", e))?;
-    let rows: Vec<serde_json::Value> = stmt.query_map([], |r| {
-        r.get::<usize, serde_json::Value>(0)
-    }).map_err(|e| format!("query: {}", e))?
-    .filter_map(|r| r.ok())
-    .collect();
-
-    let current_max = rows.iter()
-        .filter_map(|v| v.get("modified").and_then(|m| m.as_str()))
-        .max()
-        .unwrap_or("")
-        .to_string();
+    let current_max: String = conn.query_row(
+        "SELECT IFNULL(MAX(json_extract(meta, '$.modified')), '') FROM tiddlers",
+        [],
+        |r| r.get(0),
+    ).map_err(|e| format!("query max modified: {}", e))?;
 
     Ok(!current_max.is_empty() && current_max != last_max_modified)
 }
@@ -709,22 +699,14 @@ async fn do_backup_and_upload(
             .map_err(|e| format!("backup run: {}", e))?;
     }
 
-    // 2. 获取当前最大 modified 时间戳（在单独的同步块中完成，确保 conn 在 await 前释放）
-    let max_modified = {
+    // 2. 获取当前最大 modified 时间戳（直接用 SQL 聚合，避免加载全量 meta）
+    let max_modified: String = {
         let conn = Connection::open(db_path).map_err(|e| format!("open db for meta: {}", e))?;
-        let mut stmt = conn.prepare("SELECT meta FROM tiddlers").map_err(|e| format!("prepare meta: {}", e))?;
-        let rows: Vec<serde_json::Value> = stmt.query_map([], |r| {
-            r.get::<usize, serde_json::Value>(0)
-        }).map_err(|e| format!("query meta: {}", e))?
-        .filter_map(|r| r.ok())
-        .collect();
-        drop(stmt);
-        drop(conn);
-        rows.iter()
-            .filter_map(|v| v.get("modified").and_then(|m| m.as_str()))
-            .max()
-            .unwrap_or("")
-            .to_string()
+        conn.query_row(
+            "SELECT IFNULL(MAX(json_extract(meta, '$.modified')), '') FROM tiddlers",
+            [],
+            |r| r.get(0),
+        ).map_err(|e| format!("query max modified: {}", e))?
     };
 
     // 3. 上传数据库备份到 S3
@@ -756,7 +738,6 @@ async fn do_backup_and_upload(
 
     // 5. 清理临时文件
     let _ = std::fs::remove_file(&tmp_path);
-
     Ok(())
 }
 
@@ -1319,6 +1300,24 @@ impl Tiddlers {
         raw.map(Tiddler::from_value).transpose()
     }
 
+    /// 按标签过滤查询（使用 SQL LIKE，避免全量加载后再过滤）
+    pub(crate) fn get_all_by_tag(&self, tag: &str) -> AppResult<Vec<Tiddler>> {
+        tracing::debug!("getting tiddlers by tag: {}", tag);
+        // 在 meta 的 tags 字段中查找，LIKE 匹配空格分隔的标签
+        let pattern = format!("%{}%", tag);
+        const Q: &str = r#"SELECT title, revision, meta FROM tiddlers WHERE meta LIKE ?1"#;
+        let mut stmt = self.cxn.prepare_cached(Q).map_err(AppError::from)?;
+        let raw_tiddlers = stmt
+            .query_map([&pattern], |r| r.get::<usize, serde_json::Value>(2))
+            .map_err(AppError::from)?;
+        let mut tiddlers = Vec::new();
+        for qt in raw_tiddlers {
+            let raw = qt.map_err(AppError::from)?;
+            tiddlers.push(Tiddler::from_value(raw)?);
+        }
+        Ok(tiddlers)
+    }
+
     pub(crate) fn put(&mut self, tiddler: Tiddler) -> AppResult<()> {
         tracing::debug!("putting tiddler: {}", tiddler.title);
         let text = tiddler.get_text_field().unwrap_or("").to_string();
@@ -1509,10 +1508,15 @@ impl Tiddlers {
     /// 获取所有标签及其出现次数（按次数降序排列）
     pub(crate) fn tags(&self) -> AppResult<Vec<(String, usize)>> {
         use std::collections::BTreeMap;
-        let all = self.all()?;
+        // 只加载 meta，不构建 Tiddler 结构体，避免 all() 的额外开销
+        let mut stmt = self.cxn.prepare_cached("SELECT meta FROM tiddlers")
+            .map_err(AppError::from)?;
+        let rows = stmt.query_map([], |r| r.get::<usize, serde_json::Value>(0))
+            .map_err(AppError::from)?;
         let mut counts: BTreeMap<String, usize> = BTreeMap::new();
-        for t in &all {
-            if let Some(tags_str) = t.meta.get("tags").and_then(|v| v.as_str()) {
+        for row in rows {
+            let meta = row.map_err(AppError::from)?;
+            if let Some(tags_str) = meta.get("tags").and_then(|v| v.as_str()) {
                 for tag in tags_str.split(' ').filter(|s| !s.is_empty()) {
                     *counts.entry(tag.to_string()).or_default() += 1;
                 }
@@ -1863,13 +1867,12 @@ async fn list_inbox(
 ) -> AppResult<axum::Json<Vec<serde_json::Value>>> {
     let mut lock = ds.lock().await;
     let tiddlers = &mut *lock;
-    let all = tiddlers.all()?;
-
-    let inbox_items: Vec<serde_json::Value> = all.iter()
-        .filter(|t| t.has_tag("Inbox"))
+    // 使用 SQL LIKE 过滤，避免全量加载
+    let matched = tiddlers.get_all_by_tag("Inbox")?;
+    let inbox_items: Vec<serde_json::Value> = matched.iter()
+        .filter(|t| t.has_tag("Inbox"))  // 二次确认，防止 LIKE 误匹配
         .map(|t| t.as_value())
         .collect();
-
     Ok(axum::Json(inbox_items))
 }
 
@@ -2039,13 +2042,14 @@ async fn tiddlers_by_tag(
 ) -> AppResult<axum::Json<Vec<serde_json::Value>>> {
     let mut lock = ds.lock().await;
     let tiddlers = &mut *lock;
-    let all = tiddlers.all()?;
+    // 使用 SQL LIKE 过滤，避免全量加载
+    let matched = tiddlers.get_all_by_tag(&tag)?;
 
     let offset = params.offset.unwrap_or(0);
     let limit = params.limit.unwrap_or(50);
 
-    let results: Vec<serde_json::Value> = all.iter()
-        .filter(|t| t.has_tag(&tag)
+    let results: Vec<serde_json::Value> = matched.iter()
+        .filter(|t| t.has_tag(&tag)  // 二次确认
             && t.matches_time("modified", params.modified_after.as_deref(), params.modified_before.as_deref())
             && t.matches_time("created", params.created_after.as_deref(), params.created_before.as_deref()))
         .skip(offset)
