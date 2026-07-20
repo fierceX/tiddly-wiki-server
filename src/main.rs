@@ -407,6 +407,18 @@ async fn main() {
     // 3b. 初始化数据库
     let datastore = initialize_datastore(&config.server).expect("Error initializing datastore");
 
+    // 3c. 后台重建索引（FTS5 + 链接），不阻塞 HTTP 服务启动
+    {
+        let ds = datastore.clone();
+        tokio::spawn(async move {
+            // 等几秒让服务先启动完成
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            let lock = ds.lock().await;
+            lock.rebuild_indexes();
+            tracing::info!("Background index rebuild completed.");
+        });
+    }
+
     // 4. 加载 HTML 模板
     let empty_html_str = include_str!("../empty.html");
     let template = Arc::new(WikiTemplate::new(empty_html_str));
@@ -848,110 +860,10 @@ fn initialize_datastore(config: &ServerConfig) -> AppResult<DataStore> {
         tracing::info!("The database initialization has been completed.")
     } else {
         tracing::info!("Use the existing database!");
-        
-        // FTS5 迁移：重建索引（drop 旧触发器/表 → 重建 → 用 jieba 分词回填数据）
-        let _ = cxn.execute_batch(r#"
-            DROP TRIGGER IF EXISTS tiddlers_fts_ai;
-            DROP TRIGGER IF EXISTS tiddlers_fts_ad;
-            DROP TRIGGER IF EXISTS tiddlers_fts_au;
-            DROP TABLE IF EXISTS tiddlers_fts;
-        "#);
-        let fts_migration = include_str!("./init.sql");
-        if let Err(e) = cxn.execute_batch(fts_migration) {
-            tracing::warn!("FTS5 migration failed: {}", e);
-        } else {
-            // 用 jieba 分词后逐条回填 FTS5 索引
-            let rebuild_result = (|| -> Result<(), rusqlite::Error> {
-                let mut stmt = cxn.prepare("SELECT rowid, meta FROM tiddlers")?;
-                let rows: Vec<(i64, serde_json::Value)> = stmt.query_map([], |r| {
-                    Ok((r.get(0)?, r.get(1)?))
-                })?.collect::<Result<Vec<_>, _>>()?;
-                drop(stmt);
-                let mut ins = cxn.prepare(
-                    "INSERT INTO tiddlers_fts(rowid, title, text, tags) VALUES (?1, ?2, ?3, ?4)"
-                )?;
-                for (rowid, meta) in rows {
-                    let title = meta.get("title").and_then(|v| v.as_str()).unwrap_or("");
-                    let text = meta.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                    let tags = meta.get("tags").and_then(|v| v.as_str()).unwrap_or("");
-                    let tok_title = jieba.cut(title, true).join(" ");
-                    let tok_text = jieba.cut(text, true).join(" ");
-                    ins.execute(rusqlite::params![rowid, tok_title, tok_text, tags])?;
-                }
-                Ok(())
-            })();
-            match rebuild_result {
-                Ok(()) => tracing::info!("FTS5 full-text index ready (jieba tokenized)."),
-                Err(e) => tracing::warn!("FTS5 index rebuild warning: {}", e),
-            }
-        }
+        // 现有数据库在后台重建索引（不阻塞服务启动）
     }
-
-    // [[链接]] 索引回填
-    {
-        let count: i64 = cxn.query_row(
-            "SELECT COUNT(*) FROM tiddler_links",
-            [],
-            |r| r.get(0),
-        ).unwrap_or(0);
-        let has_dirty: bool = cxn.query_row(
-            "SELECT COUNT(*) > 0 FROM tiddler_links WHERE target LIKE '%|%'",
-            [],
-            |r| r.get(0),
-        ).unwrap_or(false);
-
-        let needs_backfill = count == 0 || has_dirty;
-
-        if has_dirty {
-            tracing::warn!("Found dirty link data (targets containing '|'), clearing and re-backfilling...");
-            if let Err(e) = cxn.execute("DELETE FROM tiddler_links", []) {
-                tracing::warn!("failed to clear tiddler_links: {}", e);
-            }
-        }
-
-        if needs_backfill {
-            tracing::info!("tiddler_links table is empty, backfilling link index...");
-            let mut stmt = cxn.prepare("SELECT title, meta FROM tiddlers").unwrap_or_else(|e| {
-                tracing::warn!("cannot prepare link backfill query: {}", e);
-                // 返回一个空语句占位，实际上跳过
-                return cxn.prepare("SELECT '', '{}' FROM tiddlers WHERE 1=0").unwrap();
-            });
-            if let Ok(rows) = stmt.query_map([], |r| {
-                let title: String = r.get(0)?;
-                let meta_val: String = r.get(1)?;
-                Ok((title, meta_val))
-            }) {
-                let link_re = regex::Regex::new(r"\[\[([^\]]+?)(?:\|([^\]]+))?\]\]").unwrap();
-                let mut inserted = 0usize;
-                let mut failed = 0usize;
-                for row in rows.flatten() {
-                    let (title, meta_str) = row;
-                    // 从 meta JSON 中提取 text 字段
-                    if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&meta_str) {
-                        let text = meta.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                        for cap in link_re.captures_iter(text) {
-                            let target = cap.get(2).or_else(|| cap.get(1)).map(|m| m.as_str()).unwrap_or("");
-                            if target.is_empty() { continue; }
-                            if let Err(e) = cxn.execute(
-                                "INSERT OR IGNORE INTO tiddler_links(source, target) VALUES (?1, ?2)",
-                                rusqlite::params![title, target],
-                            ) {
-                                tracing::warn!("link backfill failed: {} -> {}: {}", title, target, e);
-                                failed += 1;
-                            } else {
-                                inserted += 1;
-                            }
-                        }
-                    }
-                }
-                tracing::info!("Link index backfill complete: {} links indexed, {} failed", inserted, failed);
-            }
-        } else {
-            tracing::debug!("tiddler_links has {} rows, skipping backfill", count);
-        }
-    }
-
     let tiddlers = Tiddlers { cxn, jieba };
+
     Ok(Arc::new(Mutex::new(tiddlers)))
 }
 
@@ -1527,6 +1439,80 @@ impl Tiddlers {
         sorted.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         Ok(sorted)
     }
+
+    /// 后台重建索引（FTS5 + 链接索引），启动后执行，不阻塞服务
+    pub(crate) fn rebuild_indexes(&self) {
+        // 1. FTS5 重建
+        let _ = self.cxn.execute_batch(r#"
+            DROP TRIGGER IF EXISTS tiddlers_fts_ai;
+            DROP TRIGGER IF EXISTS tiddlers_fts_ad;
+            DROP TRIGGER IF EXISTS tiddlers_fts_au;
+            DROP TABLE IF EXISTS tiddlers_fts;
+        "#);
+        if let Ok(()) = self.cxn.execute_batch(include_str!("./init.sql")) {
+            let rebuild = (|| -> Result<(), rusqlite::Error> {
+                let mut stmt = self.cxn.prepare("SELECT rowid, meta FROM tiddlers")?;
+                let rows: Vec<(i64, serde_json::Value)> = stmt.query_map([], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })?.collect::<Result<Vec<_>, _>>()?;
+                drop(stmt);
+                let mut ins = self.cxn.prepare(
+                    "INSERT INTO tiddlers_fts(rowid, title, text, tags) VALUES (?1, ?2, ?3, ?4)"
+                )?;
+                for (rowid, meta) in rows {
+                    let title = meta.get("title").and_then(|v| v.as_str()).unwrap_or("");
+                    let text = meta.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                    let tags = meta.get("tags").and_then(|v| v.as_str()).unwrap_or("");
+                    let tok_title = self.jieba.cut(title, true).join(" ");
+                    let tok_text = self.jieba.cut(text, true).join(" ");
+                    ins.execute(rusqlite::params![rowid, tok_title, tok_text, tags])?;
+                }
+                Ok(())
+            })();
+            match rebuild {
+                Ok(()) => tracing::info!("FTS5 full-text index ready (jieba tokenized)."),
+                Err(e) => tracing::warn!("FTS5 index rebuild warning: {}", e),
+            }
+        }
+
+        // 2. 链接索引重建
+        let count: i64 = self.cxn.query_row(
+            "SELECT COUNT(*) FROM tiddler_links", [], |r| r.get(0),
+        ).unwrap_or(0);
+        if count > 0 {
+            tracing::debug!("tiddler_links has {} rows, skipping backfill", count);
+            return;
+        }
+        tracing::info!("tiddler_links table is empty, backfilling link index...");
+        let mut stmt = match self.cxn.prepare("SELECT title, meta FROM tiddlers") {
+            Ok(s) => s,
+            Err(e) => { tracing::warn!("cannot prepare link backfill: {}", e); return; }
+        };
+        if let Ok(rows) = stmt.query_map([], |r| {
+            let title: String = r.get(0)?;
+            let meta_val: String = r.get(1)?;
+            Ok((title, meta_val))
+        }) {
+            let link_re = regex::Regex::new(r"\[\[([^\]]+?)(?:\|([^\]]+))?\]\]").unwrap();
+            let mut inserted = 0usize;
+            for row in rows.flatten() {
+                let (title, meta_str) = row;
+                if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&meta_str) {
+                    let text = meta.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                    for cap in link_re.captures_iter(text) {
+                        let target = cap.get(2).or_else(|| cap.get(1)).map(|m| m.as_str()).unwrap_or("");
+                        if target.is_empty() { continue; }
+                        let _ = self.cxn.execute(
+                            "INSERT OR IGNORE INTO tiddler_links(source, target) VALUES (?1, ?2)",
+                            rusqlite::params![title, target],
+                        );
+                        inserted += 1;
+                    }
+                }
+            }
+            tracing::info!("Link index backfill complete: {} links indexed", inserted);
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Debug)]
@@ -1535,6 +1521,7 @@ pub(crate) struct Tiddler {
     revision: u64,
     meta: serde_json::Value,
 }
+
 
 impl Tiddler {
     pub(crate) fn as_value(&self) -> Value {
