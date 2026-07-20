@@ -367,17 +367,15 @@ impl WikiClient {
             Err(_) => ("0".into(), "".into(), "".into()),
         };
 
-        let now = chrono::Local::now();
-        let ts = now.format("%Y%m%d%H%M%S").to_string() + &format!("{:03}", now.timestamp_subsec_millis());
         let username = std::env::var("WIKI_USERNAME").unwrap_or_default();
 
+        // 不发送 created/modified，由服务器填充服务器时间
         let mut payload = json!({
             "title": title,
             "text": content,
             "type": "text/markdown",
             "tags": tags.unwrap_or(""),
             "revision": revision,
-            "modified": ts,
             "modifier": username,
         });
 
@@ -385,7 +383,6 @@ impl WikiClient {
         let is_new = revision == "0";
         if is_new {
             let map = payload.as_object_mut().unwrap();
-            map.insert("created".into(), json!(ts));
             map.insert("creator".into(), json!(username));
         } else {
             if !created.is_empty() {
@@ -397,7 +394,6 @@ impl WikiClient {
                 map.insert("creator".into(), json!(creator));
             }
         }
-
         let title_enc = urlencoding::encode(title);
         self.put_json(&format!("/recipes/default/tiddlers/{}", title_enc), &payload)
     }
